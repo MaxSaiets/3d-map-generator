@@ -1,0 +1,408 @@
+import type { Metadata } from "next";
+import { notFound } from "next/navigation";
+import { getTranslations, setRequestLocale } from "next-intl/server";
+import { BASE, localeUrl, priceValidUntil } from "@/i18n/metadata";
+import { routing, locales, localeMeta, defaultLocale, type AppLocale } from "@/i18n/routing";
+import { Link } from "@/i18n/navigation";
+import { MAP_CITY_PAGES as CITY_PAGES, MAP_CITY_PAGE_BY_SLUG as CITY_PAGE_BY_SLUG, isWorldCity, isUaCity2 } from "@/lib/cityPages";
+import { UA_CITY2_LOCALES } from "@/lib/uaCities2";
+import UaCity2View from "./UaCity2View";
+import { RAIONS_BY_CITY } from "@/lib/cityRaions";
+import { STREET_PAGES_BY_CITY } from "@/lib/streetPages";
+import MapRenderFigure, { mapRenderUrl } from "@/components/MapRenderFigure";
+import AiPageText from "@/components/AiPageText";
+import OsmModelContents, { osmFaq, rotateFaq } from "@/components/OsmModelContents";
+import { cityFacts, CITY_FACTS } from "@/lib/cityFacts";
+import { WORLD_CITY_BY_SLUG } from "@/lib/worldCities";
+import { cityProse, cityDerivedFacts } from "@/lib/cityProse";
+import { MAP_TEMPLATES } from "@/lib/templates";
+import { mapPriceRange } from "@/lib/mapPrices";
+import { getCatalog, formatCatalogPrice } from "@/lib/catalog";
+import { cityFaq, contentLocale, DISTRICT_PAGES } from "@/lib/cityLanding";
+import { BLOG_ARTICLES, blogContent } from "@/lib/blog";
+
+/**
+ * Programmatic SEO: статична сторінка під кожне місто (23 × 6 локалей).
+ * Запити виду «3д мапа Львова», «brelok z mapą Lwowa», «3D-Karte von Kiew».
+ */
+export function generateStaticParams() {
+  return CITY_PAGES.map((c) => ({ city: c.slug }));
+}
+
+export const dynamicParams = false;
+
+export async function generateMetadata({
+  params,
+}: {
+  params: { locale: string; city: string };
+}): Promise<Metadata> {
+  const city = CITY_PAGE_BY_SLUG[params.city];
+  if (!city) return {};
+  const locale = ((routing.locales as readonly string[]).includes(params.locale)
+    ? params.locale
+    : defaultLocale) as AppLocale;
+  const t = await getTranslations({ locale, namespace: "cityPages" });
+  const name = city.names[locale];
+  const path = `/maps/${city.slug}`;
+
+  const languages: Record<string, string> = {};
+  for (const l of locales) languages[localeMeta[l].htmlLang] = localeUrl(l, path);
+  languages["x-default"] = localeUrl(defaultLocale, path);
+
+  const title = t("title", { city: name });
+  const description = t("description", { city: name });
+  // 26.09.2026: друге коло міст — справжній текст лише uk/en; решта мов noindex → canonical en.
+  if (isUaCity2(city.slug)) {
+    const ok = (UA_CITY2_LOCALES as readonly string[]).includes(locale);
+    const langs: Record<string, string> = { "x-default": localeUrl(defaultLocale, path) };
+    for (const l of UA_CITY2_LOCALES) langs[localeMeta[l].htmlLang] = localeUrl(l, path);
+    return {
+      title,
+      description,
+      alternates: { canonical: localeUrl(ok ? locale : "en", path), languages: langs },
+      robots: ok ? undefined : { index: false, follow: true },
+      openGraph: { title, description, url: localeUrl(locale, path), siteName: "Monadruk", type: "website", locale: localeMeta[locale].ogLocale, images: [mapRenderUrl(city.slug, BASE) ?? `${BASE}/opengraph-image`] },
+      twitter: { card: "summary_large_image", title, description, images: [mapRenderUrl(city.slug, BASE) ?? `${BASE}/opengraph-image`] },
+    };
+  }
+  return {
+    title,
+    description,
+    alternates: { canonical: localeUrl(locale, path), languages },
+    openGraph: {
+      title,
+      description,
+      url: localeUrl(locale, path),
+      siteName: "Monadruk",
+      type: "website",
+      locale: localeMeta[locale].ogLocale,
+      // Робочий рут-OG (colocated [locale]-OG дають 307→404 через next-intl as-needed).
+      images: [mapRenderUrl(city.slug, BASE) ?? `${BASE}/opengraph-image`],
+    },
+    twitter: { card: "summary_large_image", title, description, images: [mapRenderUrl(city.slug, BASE) ?? `${BASE}/opengraph-image`] },
+  };
+}
+
+export default async function CityPage({
+  params,
+}: {
+  params: { locale: string; city: string };
+}) {
+  const city = CITY_PAGE_BY_SLUG[params.city];
+  if (!city) notFound();
+  const locale = ((routing.locales as readonly string[]).includes(params.locale)
+    ? params.locale
+    : defaultLocale) as AppLocale;
+  setRequestLocale(locale);
+  if (isUaCity2(city.slug)) return <UaCity2View city={city} locale={locale} />;
+  const t = await getTranslations({ locale, namespace: "cityPages" });
+  const name = city.names[locale];
+
+  // Унікальні факти + локалізація: числа через Intl, власні назви uk/latin.
+  // Для міст Європи факти живуть у WORLD_CITIES (той самий контракт CityFacts).
+  const facts = cityFacts(city.slug) ?? WORLD_CITY_BY_SLUG[city.slug]?.facts ?? null;
+  const isWorld = isWorldCity(city.slug);
+  const nf = new Intl.NumberFormat(locale === "uk" ? "uk-UA" : locale);
+  const pn = (o: { uk: string; latin: string }) => (locale === "uk" ? o.uk : o.latin);
+  // 27.09: + питання саме про ділянку (OSM) для uk/en.
+  const faq = [...(locale === "uk" || locale === "en" ? osmFaq(city.slug, name, locale === "uk") : []), ...cityFaq(contentLocale(locale), name, "podarunok")];
+
+  const ld = {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "Product",
+        name: t("title", { city: name }),
+        description: t("description", { city: name }),
+        image: mapRenderUrl(city.slug, BASE) ?? `${BASE}/real/map-1.webp`,
+        brand: { "@type": "Brand", name: "Monadruk" },
+        sku: `MND-MAP-${city.slug}`,
+        offers: {
+          // Сторінка про 3D-МАПУ міста → діапазон цін мапи (S–XL), а не брелка.
+          // Ціни з єдиного джерела lib/mapPrices.ts (синхрон з pricing.json) — без дрейфу.
+          "@type": "AggregateOffer",
+          priceCurrency: mapPriceRange(locale).currency,
+          lowPrice: mapPriceRange(locale).low,
+          highPrice: mapPriceRange(locale).high,
+          offerCount: mapPriceRange(locale).offerCount,
+          priceValidUntil: priceValidUntil(),
+          availability: "https://schema.org/InStock",
+          url: localeUrl(locale, `/maps/${city.slug}`),
+        },
+      },
+      {
+        "@type": "BreadcrumbList",
+        itemListElement: [
+          { "@type": "ListItem", position: 1, name: "Monadruk", item: localeUrl(locale, "/") },
+          { "@type": "ListItem", position: 2, name: t("breadcrumb"), item: localeUrl(locale, "/maps") },
+          { "@type": "ListItem", position: 3, name, item: localeUrl(locale, `/maps/${city.slug}`) },
+        ],
+      },
+      {
+        "@type": "FAQPage",
+        mainEntity: faq.map((f) => ({
+          "@type": "Question",
+          name: f.q,
+          acceptedAnswer: { "@type": "Answer", text: f.a },
+        })),
+      },
+    ],
+  };
+
+  // Видимі ціни (раніше лише у JSON-LD AggregateOffer) — з єдиного каталогу
+  // (синхрон з /prices). Показуємо мапи S–XL + рельєф + магніт + брелок.
+  const cat = getCatalog(locale);
+  const priceItems = [
+    ...cat.categories[0].items, // 3D-мапи (S/M/L/XL + рельєф)
+    ...(cat.categories[1]?.items ?? []), // магніт
+    ...(cat.categories[2]?.items ?? []), // брелок
+  ];
+
+  // Споріднені міста: найближчі за відстанню (локальний кластер) + кілька
+  // найбільших за населенням — щоб блок був УНІКАЛЬНИМ на кожній сторінці
+  // (не той самий фіксований список) і давав осмислену внутрішню перелінковку.
+  const hav = (a: readonly [number, number], b: readonly [number, number]) => {
+    const R = 6371, toRad = (d: number) => (d * Math.PI) / 180;
+    const dLat = toRad(b[0] - a[0]), dLng = toRad(b[1] - a[1]);
+    const s = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(a[0])) * Math.cos(toRad(b[0])) * Math.sin(dLng / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(s));
+  };
+  const rest = CITY_PAGES.filter((c) => c.slug !== city.slug);
+  const nearest = [...rest].sort((a, b) => hav(city.center, a.center) - hav(city.center, b.center)).slice(0, 9);
+  const biggest = [...rest]
+    .sort((a, b) => (CITY_FACTS[b.slug]?.population ?? 0) - (CITY_FACTS[a.slug]?.population ?? 0))
+    .filter((c) => !nearest.some((n) => n.slug === c.slug))
+    .slice(0, 3);
+  const others = [...nearest, ...biggest];
+
+  // Райони міста (rank 3): унікальні prose-блерби + глибокі лінки на /create?template=
+  const districts = MAP_TEMPLATES.filter((tpl) => tpl.cityKey === city.key);
+
+  return (
+    <main id="main-content" tabIndex={-1} className="mx-auto max-w-[820px] px-5 py-14 lg:py-20">
+      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(ld) }} />
+      <nav className="text-[13px] text-ink-3" aria-label="breadcrumb">
+        <Link href="/" className="hover:underline">Monadruk</Link>
+        {" / "}
+        <Link href="/maps" className="hover:underline">{t("breadcrumb")}</Link>
+        {" / "}
+        <span className="text-ink">{name}</span>
+      </nav>
+      <h1 className="mt-5 text-[clamp(28px,4vw,46px)] leading-tight">{t("h1", { city: name })}</h1>
+      <p className="mt-5 text-[15px] leading-relaxed text-ink-2">{t("p1", { city: name })}</p>
+      <p className="mt-3 text-[15px] leading-relaxed text-ink-2">{t("p2", { city: name })}</p>
+      {/* Унікальна prose-фраза на основі фактів (анти-doorway): дужкова конструкція
+          уникає відмінкових/родових узгоджень з власними назвами у 6 мовах. */}
+      {/* УНІКАЛЬНИЙ ОПИС: замість однієї спільної фрази (яка й давала 78%
+          дублювання між містами) — 6 структур × обчислювані інсайти
+          (щільність, вік, площа) з реальних даних. Див. lib/cityProse.ts. */}
+      {facts && (
+        <div className="mt-3 flex flex-col gap-3">
+          {cityProse({ slug: city.slug, name, facts, locale }).map((para, idx) => (
+            <p key={idx} className="text-[15px] leading-relaxed text-ink-2">{para}</p>
+          ))}
+        </div>
+      )}
+
+      {/* Унікальні факти про місто (анти-doorway): кожна сторінка отримує
+          відмінні числа/назви, тож контент не byte-identical. Гард: якщо для
+          slug немає даних — секція не рендериться (поведінка як раніше). */}
+      {facts && (
+        <section className="mt-9 rounded-[18px] border border-line-soft bg-white/60 px-5 py-5">
+          <h2 className="text-[16px] font-semibold text-ink">{t("factsTitle", { city: name })}</h2>
+          <dl className="mt-3 grid gap-x-7 gap-y-1.5 text-[14px] sm:grid-cols-2">
+            {[
+              [t("fPopulation"), `${nf.format(facts.population)} (${facts.populationYear})`],
+              [facts.firstMention ? t("fFirstMention") : t("fFounded"), String(facts.founded)],
+              [t("fArea"), `${nf.format(Math.round(facts.area_km2))} ${locale === "uk" ? "км²" : "km²"}`],
+              [t("fRiver"), pn(facts.river)],
+              [t("fOblast"), pn(facts.oblast)],
+              [t("fLandmark"), pn(facts.landmark)],
+              // Обчислювані показники: унікальні для кожного міста числа,
+              // яких немає в жодного іншого (анти-дедуплікація).
+              [
+                locale === "uk" ? "Щільність" : "Density",
+                `${nf.format(cityDerivedFacts(facts).density)} ${locale === "uk" ? "осіб/км²" : "people/km²"}`,
+              ],
+              [
+                locale === "uk" ? "Вік міста" : "City age",
+                `${nf.format(cityDerivedFacts(facts).age)} ${locale === "uk" ? "років" : "years"}`,
+              ],
+            ].map(([label, value]) => (
+              <div key={label} className="flex items-baseline justify-between gap-3 border-b border-line-soft/50 py-1">
+                <dt className="text-ink-3">{label}</dt>
+                <dd className="text-right font-semibold text-ink">{value}</dd>
+              </div>
+            ))}
+          </dl>
+        </section>
+      )}
+
+      <div className="mt-8 flex flex-wrap gap-3">
+        <Link
+          href={`/create?city=${city.key}`}
+          className="inline-flex min-h-[48px] items-center justify-center rounded-[22px] bg-[var(--accent-strong)] px-6 py-3 text-sm font-semibold text-white transition hover:opacity-90"
+        >
+          {t("ctaMap", { city: name })}
+        </Link>
+        <Link
+          href={isWorld ? "/keychains" : `/keychains?city=${city.key}`}
+          className="inline-flex min-h-[48px] items-center justify-center rounded-[22px] border border-line-soft bg-white/80 px-6 py-3 text-sm font-semibold text-ink transition hover:border-[var(--accent)]"
+        >
+          {t("ctaKeychain", { city: name })}
+        </Link>
+      </div>
+
+      {(locale === "uk" || locale === "en") && <AiPageText id={city.slug} isUA={locale === "uk"} />}
+      <MapRenderFigure id={city.slug} name={name} isUA={locale === "uk"} />
+      {(locale === "uk" || locale === "en") && <OsmModelContents id={city.slug} name={name} isUA={locale === "uk"} />}
+
+      {/* Райони міста (rank 3): унікальний контент + глибокі лінки на готову сцену
+          конструктора (/create?template=). Блерби uk-only → решта локалей лише назва. */}
+      {districts.length > 0 && (
+        <section className="mt-12">
+          <h2 className="text-[20px] font-semibold">{t("districtsTitle")}</h2>
+          <ul className="mt-4 grid gap-3 sm:grid-cols-2">
+            {districts.map((d) => {
+              const dp = DISTRICT_PAGES.find((x) => x.templateId === d.id);
+              const href = dp ? `/maps/${city.slug}/${dp.slug}` : `/create?template=${d.id}`;
+              return (
+                <li key={d.id}>
+                  <Link
+                    href={href}
+                    className="block h-full rounded-[16px] border border-line-soft bg-white/70 px-4 py-3 transition hover:border-[var(--accent)]"
+                  >
+                    <span className="text-[15px] font-semibold text-ink">{d.district}</span>
+                    {locale === "uk" && d.blurb ? (
+                      <span className="mt-1 block text-[13px] leading-snug text-ink-2">{d.blurb}</span>
+                    ) : null}
+                  </Link>
+                </li>
+              );
+            })}
+          </ul>
+        </section>
+      )}
+
+      {/* 26.09.2026: адміністративні райони (lib/cityRaions.ts) — лише uk/en мають сторінки. */}
+      {(RAIONS_BY_CITY[city.slug]?.length ?? 0) > 0 && (locale === "uk" || locale === "en") && (
+        <section className="mt-12">
+          <h2 className="text-[20px] font-semibold">
+            {locale === "uk" ? `3D-модель району: ${name}` : `3D map by district: ${name}`}
+          </h2>
+          <ul className="mt-4 grid gap-2 sm:grid-cols-2">
+            {RAIONS_BY_CITY[city.slug].map((r) => (
+              <li key={r.slug}>
+                <Link
+                  href={`/maps/${city.slug}/${r.slug}`}
+                  className="block rounded-[14px] border border-line-soft bg-white/70 px-4 py-2.5 text-[14.5px] font-medium text-ink transition hover:border-[var(--accent)]"
+                >
+                  {locale === "uk" ? r.uk : r.en}
+                </Link>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {/* 27.09.2026: відомі вулиці міста (сторінки uk/en). */}
+      {(STREET_PAGES_BY_CITY[city.slug]?.length ?? 0) > 0 && (locale === "uk" || locale === "en") && (
+        <section className="mt-12">
+          <h2 className="text-[20px] font-semibold">
+            {locale === "uk" ? `3D-модель вулиці: ${name}` : `3D map of a street in ${name}`}
+          </h2>
+          <ul className="mt-4 flex flex-wrap gap-2">
+            {STREET_PAGES_BY_CITY[city.slug].slice(0, 40).map((st) => (
+              <li key={st.slug}>
+                <Link
+                  href={`/maps/${city.slug}/${st.slug}`}
+                  className="inline-block rounded-full border border-line-soft bg-white/70 px-3.5 py-1.5 text-[13px] font-medium text-ink-2 transition hover:border-[var(--accent)] hover:text-ink"
+                >
+                  {locale === "uk" ? st.uk : st.en || st.uk}
+                </Link>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {/* Видимі ЦІНИ у гривнях — для покупця, SEO і перевірки LiqPay (115 сторінок). */}
+      <section className="mt-12 rounded-[18px] border border-line-soft bg-white/60 px-5 py-5">
+        <h2 className="text-[17px] font-semibold text-ink">{cat.h1} — {name}</h2>
+        <ul className="mt-3 grid gap-x-7 gap-y-1.5 text-[14px] text-ink-2 sm:grid-cols-2">
+          {priceItems.map((it) => (
+            <li key={it.name} className="flex items-baseline justify-between gap-3 border-b border-line-soft/50 py-1">
+              <span>{it.name}</span>
+              <span className="whitespace-nowrap font-semibold text-[var(--accent-strong)]">
+                {formatCatalogPrice(it.uah, it.kind, locale, it.usd)}
+              </span>
+            </li>
+          ))}
+        </ul>
+        <Link href="/prices" className="mt-3 inline-block text-[13.5px] font-semibold text-[var(--accent-strong)] hover:underline">
+          {cat.h1} →
+        </Link>
+      </section>
+
+      {/* FAQ (видимий, +FAQPage JSON-LD вище). */}
+      <section className="mt-12">
+        <h2 className="text-[20px] font-semibold">{locale === "uk" ? "Часті запитання" : "FAQ"}</h2>
+        <dl className="mt-4 flex flex-col gap-4">
+          {faq.map((f) => (
+            <div key={f.q}>
+              <dt className="text-[15px] font-semibold text-ink">{f.q}</dt>
+              <dd className="mt-1.5 text-[14.5px] leading-relaxed text-ink-2">{f.a}</dd>
+            </div>
+          ))}
+        </dl>
+      </section>
+
+      {/* Читати далі: 2 статті блогу — РОТАЦІЯ за індексом міста (раніше всі 23
+          міста лінкували ті самі 2 статті → 13 статей без внутрішніх лінків;
+          тепер лінк-еквіті розходиться по всьому блогу, вибір детермінований). */}
+      <section className="mt-10">
+        <h2 className="text-[18px] font-semibold text-ink">{locale === "uk" ? "Читати далі" : "Read more"}</h2>
+        <ul className="mt-3 flex flex-col gap-2">
+          {(() => {
+            const ci = Math.max(0, CITY_PAGES.findIndex((c) => c.slug === city.slug));
+            return [0, 1].map((k) => BLOG_ARTICLES[(ci * 2 + k) % BLOG_ARTICLES.length]);
+          })().map((a) => (
+            <li key={a.slug}>
+              <Link href={`/blog/${a.slug}`} className="text-[14.5px] font-medium text-[var(--accent-strong)] hover:underline">
+                {blogContent(a, locale).h1} →
+              </Link>
+            </li>
+          ))}
+        </ul>
+      </section>
+
+      {/* Крос-лінки на brelok/podarunok сторінки цього ж міста (кластер міста,
+          хвиля 2 programmatic SEO). Тексти bilingual-inline (контент цих сторінок
+          uk/en з lib/cityLanding — той самий принцип, без нових i18n-ключів). */}
+      {/* Гард: для міст Європи сторінок /brelok і /podarunok НЕМА (свідомо, щоб
+          не роздувати краул-бюджет) → ведемо на хаби, а не в 404. */}
+      <section className="mt-12 flex flex-col gap-2 rounded-[18px] border border-line-soft bg-white/60 px-5 py-5">
+        <Link href={isWorld ? "/brelok" : `/brelok/${city.slug}`} className="text-[14.5px] font-semibold text-[var(--accent-strong)] hover:underline">
+          {locale === "uk" ? `Брелок з картою міста — ${name}` : `City map keychain — ${name}`} →
+        </Link>
+        <Link href={isWorld ? "/podarunok" : `/podarunok/${city.slug}`} className="text-[14.5px] font-semibold text-[var(--accent-strong)] hover:underline">
+          {locale === "uk" ? `Подарунок з міста — ${name}` : `A gift from ${name}`} →
+        </Link>
+      </section>
+
+      <h2 className="mt-14 text-[20px] font-semibold">{t("others")}</h2>
+      <ul className="mt-4 flex flex-wrap gap-2">
+        {others.map((c) => (
+          <li key={c.slug}>
+            <Link
+              href={`/maps/${c.slug}`}
+              className="inline-block rounded-full border border-line-soft bg-white/70 px-4 py-2 text-[13.5px] font-medium text-ink-2 transition hover:border-[var(--accent)] hover:text-ink"
+            >
+              {c.names[locale]}
+            </Link>
+          </li>
+        ))}
+      </ul>
+    </main>
+  );
+}

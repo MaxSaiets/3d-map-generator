@@ -1,0 +1,303 @@
+import type { Metadata } from "next";
+import { notFound } from "next/navigation";
+import { setRequestLocale } from "next-intl/server";
+import { BASE, seoTitle, localeUrl, priceValidUntil } from "@/i18n/metadata";
+import { routing, locales, localeMeta, defaultLocale, type AppLocale } from "@/i18n/routing";
+import { Link } from "@/i18n/navigation";
+import { CITY_PAGE_BY_SLUG } from "@/lib/cityPages";
+import { MAP_TEMPLATES } from "@/lib/templates";
+import { CITY_RAIONS, RAION_LOCALES } from "@/lib/cityRaions";
+import RaionView from "./RaionView";
+import StreetView from "./StreetView";
+import { STREET_PAGES } from "@/lib/streetPages";
+import { STREET_LOCALES } from "@/lib/cityStreets";
+import { mapPriceRange } from "@/lib/mapPrices";
+import { DISTRICT_PAGES, DISTRICT_BY_CITY_SLUG, contentLocale, cityFaq, landingCopy, districtLocales } from "@/lib/cityLanding";
+
+/**
+ * Programmatic SEO рівень 3: район міста (/maps/[city]/[district], 12 × 6 локалей).
+ * Найточніший запит («3d мапа поділу», «мапа площі ринок львів») — найвища
+ * конверсія. Контент — ручний, з lib/cityLanding.ts DISTRICT_PAGES (12 записів,
+ * дзеркалять MAP_TEMPLATES із lib/templates.ts). Deep-link на готову сцену
+ * конструктора: /create?template={templateId}.
+ */
+export function generateStaticParams() {
+  return [
+    ...DISTRICT_PAGES.map((d) => ({ city: d.citySlug, district: d.slug })),
+    // 26.09.2026: адміністративні райони великих міст (lib/cityRaions.ts).
+    ...CITY_RAIONS.map((r) => ({ city: r.citySlug, district: r.slug })),
+    // 27.09.2026: відомі вулиці (lib/cityStreets.ts).
+    ...STREET_PAGES.map((x) => ({ city: x.citySlug, district: x.slug })),
+  ];
+}
+
+export const dynamicParams = false;
+
+function resolve(citySlug: string, districtSlug: string) {
+  const district = DISTRICT_PAGES.find((d) => d.citySlug === citySlug && d.slug === districtSlug);
+  if (!district) return null;
+  const city = CITY_PAGE_BY_SLUG[citySlug];
+  if (!city) return null;
+  const tpl = MAP_TEMPLATES.find((t) => t.id === district.templateId);
+  if (!tpl) return null;
+  return { district, city, tpl };
+}
+
+export async function generateMetadata({
+  params,
+}: {
+  params: { locale: string; city: string; district: string };
+}): Promise<Metadata> {
+  const raion = CITY_RAIONS.find((x) => x.citySlug === params.city && x.slug === params.district);
+  if (raion && CITY_PAGE_BY_SLUG[params.city]) {
+    const loc = ((routing.locales as readonly string[]).includes(params.locale) ? params.locale : defaultLocale) as AppLocale;
+    const city = CITY_PAGE_BY_SLUG[params.city];
+    const isUA = loc === "uk";
+    const path = `/maps/${city.slug}/${raion.slug}`;
+    const ok = (RAION_LOCALES as readonly string[]).includes(loc);
+    const title = isUA
+      ? `3D-модель: ${raion.uk}, ${city.names.uk} — купити макет від 350 ₴`
+      : `3D model of ${raion.en}, ${city.names.en} — buy a district map`;
+    const description = isUA
+      ? `Купити 3D-мапу чи макет: ${raion.uk} (${city.names.uk}). Обʼємна модель вашої вулиці з будинками й парками, превʼю онлайн безкоштовно, друк від 350 ₴, доставка Новою Поштою.`
+      : `Buy a 3D map of ${raion.en} (${city.names.en}): your street with real building heights, parks and water. Free online preview, printed and shipped.`;
+    const langs: Record<string, string> = { "x-default": localeUrl(defaultLocale, path) };
+    for (const l of RAION_LOCALES) langs[localeMeta[l].htmlLang] = localeUrl(l, path);
+    return {
+      title: seoTitle(title),
+      description,
+      alternates: { canonical: localeUrl(ok ? loc : "en", path), languages: langs },
+      robots: ok ? undefined : { index: false, follow: true },
+      openGraph: { title, description, url: localeUrl(loc, path), siteName: "Monadruk", type: "website", locale: localeMeta[loc].ogLocale, images: [`${BASE}/opengraph-image`] },
+      twitter: { card: "summary_large_image", title, description, images: [`${BASE}/opengraph-image`] },
+    };
+  }
+  const street = STREET_PAGES.find((x) => x.citySlug === params.city && x.slug === params.district);
+  if (street && CITY_PAGE_BY_SLUG[params.city]) {
+    const loc = ((routing.locales as readonly string[]).includes(params.locale) ? params.locale : defaultLocale) as AppLocale;
+    const city = CITY_PAGE_BY_SLUG[params.city];
+    const isUA = loc === "uk";
+    const path = `/maps/${city.slug}/${street.slug}`;
+    const ok = (STREET_LOCALES as readonly string[]).includes(loc);
+    const sName = isUA ? street.uk : street.en || street.uk;
+    const title = isUA
+      ? `3D-модель: ${street.uk}, ${city.names.uk} — купити макет вулиці`
+      : `3D model of ${sName}, ${city.names.en} — buy a street map`;
+    const description = isUA
+      ? `Купити 3D-мапу чи макет: ${street.uk} (${city.names.uk}). Будинки з реальними висотами${street.lengthM ? `, вулиця ~${street.lengthM} м` : ""}. Превʼю онлайн безкоштовно, друк від 350 ₴, доставка Новою Поштою.`
+      : `Buy a 3D map of ${sName} (${city.names.en}): real building heights, free online preview, printed and shipped.`;
+    const langs: Record<string, string> = { "x-default": localeUrl(defaultLocale, path) };
+    for (const l of STREET_LOCALES) langs[localeMeta[l].htmlLang] = localeUrl(l, path);
+    return {
+      title: seoTitle(title),
+      description,
+      alternates: { canonical: localeUrl(ok ? loc : "en", path), languages: langs },
+      robots: ok ? undefined : { index: false, follow: true },
+      openGraph: { title, description, url: localeUrl(loc, path), siteName: "Monadruk", type: "website", locale: localeMeta[loc].ogLocale, images: [`${BASE}/opengraph-image`] },
+      twitter: { card: "summary_large_image", title, description, images: [`${BASE}/opengraph-image`] },
+    };
+  }
+  const r = resolve(params.city, params.district);
+  if (!r) return {};
+  const locale = ((routing.locales as readonly string[]).includes(params.locale)
+    ? params.locale
+    : defaultLocale) as AppLocale;
+  const c = landingCopy(r.district.content, contentLocale(locale));
+  const path = `/maps/${r.city.slug}/${r.district.slug}`;
+  const translated = districtLocales(r.district);
+  const isTranslated = translated.includes(locale);
+  const languages: Record<string, string> = {};
+  for (const l of locales) if (translated.includes(l)) languages[localeMeta[l].htmlLang] = localeUrl(l, path);
+  languages["x-default"] = localeUrl(defaultLocale, path);
+  return {
+    title: seoTitle(c.title),
+    description: c.description,
+    // Неперекладена локаль = en-текст → не індексуємо, канонічна — en.
+    alternates: { canonical: localeUrl(isTranslated ? locale : "en", path), languages },
+    robots: isTranslated ? undefined : { index: false, follow: true },
+    openGraph: {
+      title: c.title,
+      description: c.description,
+      url: localeUrl(locale, path),
+      siteName: "Monadruk",
+      type: "website",
+      locale: localeMeta[locale].ogLocale,
+      images: [`${BASE}/opengraph-image`],
+    },
+    twitter: { card: "summary_large_image", title: c.title, description: c.description, images: [`${BASE}/opengraph-image`] },
+  };
+}
+
+export default async function DistrictPage({
+  params,
+}: {
+  params: { locale: string; city: string; district: string };
+}) {
+  const raion = CITY_RAIONS.find((x) => x.citySlug === params.city && x.slug === params.district);
+  if (raion && CITY_PAGE_BY_SLUG[params.city]) {
+    const loc = ((routing.locales as readonly string[]).includes(params.locale) ? params.locale : defaultLocale) as AppLocale;
+    setRequestLocale(loc);
+    return <RaionView raion={raion} city={CITY_PAGE_BY_SLUG[params.city]} locale={loc} />;
+  }
+  const street = STREET_PAGES.find((x) => x.citySlug === params.city && x.slug === params.district);
+  if (street && CITY_PAGE_BY_SLUG[params.city]) {
+    const loc = ((routing.locales as readonly string[]).includes(params.locale) ? params.locale : defaultLocale) as AppLocale;
+    setRequestLocale(loc);
+    return <StreetView street={street} city={CITY_PAGE_BY_SLUG[params.city]} locale={loc} />;
+  }
+  const r = resolve(params.city, params.district);
+  if (!r) notFound();
+  const { district, city, tpl } = r;
+  const locale = ((routing.locales as readonly string[]).includes(params.locale)
+    ? params.locale
+    : defaultLocale) as AppLocale;
+  setRequestLocale(locale);
+  const isUA = locale === "uk";
+  const cl = contentLocale(locale);
+  const c = landingCopy(district.content, cl);
+  const cityName = city.names[locale];
+  const districtName = isUA ? tpl.district : district.enName;
+  const path = `/maps/${city.slug}/${district.slug}`;
+  const faq = cityFaq(cl, cityName, "podarunok");
+
+  const range = mapPriceRange(locale);
+  const ld = {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "Product",
+        name: c.h1,
+        description: c.description,
+        image: `${BASE}/real/map-1.webp`,
+        brand: { "@type": "Brand", name: "Monadruk" },
+        sku: `MND-DISTRICT-${district.templateId}`,
+        offers: {
+          "@type": "AggregateOffer",
+          priceCurrency: range.currency,
+          lowPrice: range.low,
+          highPrice: range.high,
+          offerCount: range.offerCount,
+          priceValidUntil: priceValidUntil(),
+          availability: "https://schema.org/InStock",
+          url: localeUrl(locale, path),
+        },
+      },
+      {
+        "@type": "BreadcrumbList",
+        itemListElement: [
+          { "@type": "ListItem", position: 1, name: "Monadruk", item: localeUrl(locale, "/") },
+          { "@type": "ListItem", position: 2, name: isUA ? "Мапи" : "Maps", item: localeUrl(locale, "/maps") },
+          { "@type": "ListItem", position: 3, name: cityName, item: localeUrl(locale, `/maps/${city.slug}`) },
+          { "@type": "ListItem", position: 4, name: districtName, item: localeUrl(locale, path) },
+        ],
+      },
+      {
+        "@type": "FAQPage",
+        mainEntity: faq.map((f) => ({
+          "@type": "Question",
+          name: f.q,
+          acceptedAnswer: { "@type": "Answer", text: f.a },
+        })),
+      },
+    ],
+  };
+
+  const siblings = (DISTRICT_BY_CITY_SLUG[city.slug] ?? []).filter((d) => d.slug !== district.slug);
+
+  const ui = isUA
+    ? {
+        maps: "Мапи",
+        cta: "Створити цю мапу",
+        recommend: `Рекомендований розмір — ${tpl.sizeMm ?? 80} мм${tpl.style === "relief" ? ", з увімкненим рельєфом" : ""}.`,
+        cityLink: `Усі райони міста — ${cityName}`,
+        brelok: `Брелок з районом — ${districtName}`,
+        siblings: "Інші райони цього міста",
+      }
+    : {
+        maps: "Maps",
+        cta: "Create this map",
+        recommend: `Recommended size — ${tpl.sizeMm ?? 80} mm${tpl.style === "relief" ? ", with relief enabled" : ""}.`,
+        cityLink: `All districts of ${cityName}`,
+        brelok: `Keychain with this district`,
+        siblings: "Other districts of this city",
+      };
+
+  return (
+    <main id="main-content" tabIndex={-1} className="mx-auto max-w-[820px] px-5 py-14 lg:py-20">
+      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(ld) }} />
+      <nav className="text-[13px] text-ink-3" aria-label="breadcrumb">
+        <Link href="/" className="hover:underline">Monadruk</Link>
+        {" / "}
+        <Link href="/maps" className="hover:underline">{ui.maps}</Link>
+        {" / "}
+        <Link href={`/maps/${city.slug}`} className="hover:underline">{cityName}</Link>
+        {" / "}
+        <span className="text-ink">{districtName}</span>
+      </nav>
+      <h1 className="mt-5 text-[clamp(28px,4vw,46px)] leading-tight">{c.h1}</h1>
+      {c.intro.map((p, i) => (
+        <p key={i} className={`${i === 0 ? "mt-5" : "mt-3"} text-[15px] leading-relaxed text-ink-2`}>{p}</p>
+      ))}
+      <p className="mt-3 text-[14px] font-semibold text-[var(--accent-strong)]">{ui.recommend}</p>
+
+      <div className="mt-8 flex flex-wrap gap-3">
+        <Link
+          href={`/create?template=${district.templateId}`}
+          className="inline-flex min-h-[48px] items-center justify-center rounded-[22px] bg-[var(--accent-strong)] px-6 py-3 text-sm font-semibold text-white transition hover:opacity-90"
+        >
+          {ui.cta}
+        </Link>
+      </div>
+
+      {c.sections.map((s, i) => (
+        <section key={i} className="mt-10">
+          <h2 className="text-[20px] font-semibold">{s.h2}</h2>
+          {s.p.map((para, j) => (
+            <p key={j} className="mt-3 text-[15px] leading-relaxed text-ink-2">{para}</p>
+          ))}
+        </section>
+      ))}
+
+      {/* FAQ (спільний з іншими сторінками міста, +FAQPage JSON-LD вище). */}
+      <section className="mt-10">
+        <h2 className="text-[20px] font-semibold">{isUA ? "Часті запитання" : "FAQ"}</h2>
+        <dl className="mt-4 flex flex-col gap-4">
+          {faq.map((f) => (
+            <div key={f.q}>
+              <dt className="text-[15px] font-semibold text-ink">{f.q}</dt>
+              <dd className="mt-1.5 text-[14.5px] leading-relaxed text-ink-2">{f.a}</dd>
+            </div>
+          ))}
+        </dl>
+      </section>
+
+      {/* Крос-лінки на кластер міста. */}
+      <section className="mt-10 flex flex-col gap-2 rounded-[18px] border border-line-soft bg-white/60 px-5 py-5">
+        <Link href={`/maps/${city.slug}`} className="text-[14.5px] font-semibold text-[var(--accent-strong)] hover:underline">
+          {ui.cityLink} →
+        </Link>
+        <Link href={`/brelok/${city.slug}`} className="text-[14.5px] font-semibold text-[var(--accent-strong)] hover:underline">
+          {ui.brelok} →
+        </Link>
+      </section>
+
+      {siblings.length > 0 && (
+        <section className="mt-10">
+          <h2 className="text-[18px] font-semibold text-ink">{ui.siblings}</h2>
+          <ul className="mt-3 flex flex-wrap gap-2">
+            {siblings.map((d) => (
+              <li key={d.slug}>
+                <Link
+                  href={`/maps/${city.slug}/${d.slug}`}
+                  className="inline-block rounded-full border border-line-soft bg-white/70 px-4 py-2 text-[13.5px] font-medium text-ink-2 transition hover:border-[var(--accent)] hover:text-ink"
+                >
+                  {isUA ? MAP_TEMPLATES.find((t) => t.id === d.templateId)?.district : d.enName}
+                </Link>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+    </main>
+  );
+}

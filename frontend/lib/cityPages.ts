@@ -1,0 +1,114 @@
+import { CITIES } from "@/lib/templates";
+import { WORLD_CITIES, WORLD_CITY_BY_SLUG } from "@/lib/worldCities";
+import { UA_CITIES_2, UA_CITY2_BY_SLUG } from "@/lib/uaCities2";
+import type { AppLocale } from "@/i18n/routing";
+
+/**
+ * Programmatic SEO: дані для сторінок міст /maps/[slug].
+ * Слаг — латиницею в нижньому регістрі; назви локалізовані (uk з CITIES,
+ * pl/de мають усталені екзоніми, en/fr/es — офіційна транслітерація).
+ */
+export interface CityPage {
+  slug: string;
+  key: string; // CITIES key
+  names: Record<AppLocale, string>;
+  center: [number, number];
+}
+
+const NAME_OVERRIDES: Record<string, Partial<Record<AppLocale, string>>> = {
+  Kyiv: { pl: "Kijów", de: "Kiew" },
+  Lviv: { pl: "Lwów", de: "Lemberg" },
+  Odesa: { pl: "Odessa", de: "Odessa", fr: "Odessa", es: "Odesa" },
+  Kharkiv: { pl: "Charków", de: "Charkiw", ro: "Harkiv" },
+  Dnipro: { pl: "Dniepr" },
+  Vinnytsia: { pl: "Winnica", de: "Winnyzja", ro: "Vinnîțea" },
+  Khmelnytskyi: { pl: "Chmielnicki", de: "Chmelnyzkyj", ro: "Hmelnițki" },
+  Zaporizhzhia: { pl: "Zaporoże", de: "Saporischschja", ro: "Zaporijjea" },
+  Kryvyi_Rih: { pl: "Krzywy Róg", de: "Krywyj Rih", ro: "Krivîi Rih" },
+  Mykolaiv: { pl: "Mikołajów", de: "Mykolajiw", ro: "Mîkolaiv" },
+  Poltava: { pl: "Połtawa", de: "Poltawa" },
+  Cherkasy: { pl: "Czerkasy", de: "Tscherkassy", ro: "Cerkasî" },
+  Chernihiv: { pl: "Czernihów", de: "Tschernihiw", ro: "Cernihiv" },
+  Ternopil: { pl: "Tarnopol" },
+  IvanoFrankivsk: { pl: "Iwano-Frankiwsk", de: "Iwano-Frankiwsk" },
+  Zhytomyr: { pl: "Żytomierz", de: "Schytomyr", ro: "Jîtomîr" },
+  Rivne: { pl: "Równe", de: "Riwne" },
+  Lutsk: { pl: "Łuck", de: "Luzk", ro: "Luțk" },
+  Uzhhorod: { pl: "Użhorod", de: "Uschhorod", ro: "Ujhorod" },
+  Chernivtsi: { pl: "Czerniowce", de: "Tscherniwzi", ro: "Cernăuți" },
+  Kherson: { pl: "Chersoń", de: "Cherson", ro: "Herson" },
+  Sumy: { ro: "Sumî" },
+  Kropyvnytskyi: { pl: "Kropywnycki", de: "Kropywnyzkyj", ro: "Kropîvnîțkîi" },
+};
+
+/** "Kryvyi_Rih" → "Kryvyi Rih", "IvanoFrankivsk" → "Ivano-Frankivsk" */
+function latinName(key: string): string {
+  if (key === "IvanoFrankivsk") return "Ivano-Frankivsk";
+  return key.replace(/_/g, " ");
+}
+
+function slugify(key: string): string {
+  if (key === "IvanoFrankivsk") return "ivano-frankivsk";
+  return key.toLowerCase().replace(/_/g, "-");
+}
+
+export const CITY_PAGES: CityPage[] = CITIES.map((c) => {
+  const latin = latinName(c.key);
+  const o = NAME_OVERRIDES[c.key] || {};
+  return {
+    slug: slugify(c.key),
+    key: c.key,
+    center: c.center,
+    names: {
+      uk: c.label,
+      en: o.en ?? latin,
+      de: o.de ?? latin,
+      pl: o.pl ?? latin,
+      fr: o.fr ?? latin,
+      es: o.es ?? latin,
+      ro: o.ro ?? latin,
+    },
+  };
+});
+
+export const CITY_PAGE_BY_SLUG: Record<string, CityPage> = Object.fromEntries(
+  CITY_PAGES.map((c) => [c.slug, c]),
+);
+
+/**
+ * SEO-РОЗШИРЕННЯ НА ЄС: міста Європи отримують сторінки ЛИШЕ у /maps.
+ * Свідомо НЕ додаємо їх у /brelok і /podarunok — інакше один крок роздув би
+ * сайт на ~150 URL, а в GSC і так 238 сторінок чекають сканування
+ * (краул-бюджет молодого домену обмежений). Спершу — індексація цих 72.
+ */
+export const WORLD_CITY_PAGES: CityPage[] = WORLD_CITIES.map((c) => ({
+  slug: c.slug,
+  key: c.key,
+  center: c.center,
+  names: c.names,
+}));
+
+/** 26.09.2026: друге коло міст України (lib/uaCities2.ts) — сторінки лише uk/en. */
+export const UA_CITY2_PAGES: CityPage[] = UA_CITIES_2.map((c) => ({
+  slug: c.slug,
+  key: `UA2_${c.slug}`,
+  center: c.center,
+  names: { uk: c.names.uk, en: c.names.en, de: c.names.en, pl: c.names.en, fr: c.names.en, es: c.names.en, ro: c.names.en },
+}));
+
+/** true — місто з другого кола (без шаблонів конструктора, /brelok і /podarunok). */
+export function isUaCity2(slug: string): boolean {
+  return Boolean(UA_CITY2_BY_SLUG[slug]);
+}
+
+/** Усі міста, що мають сторінку /maps/[slug] (UA + друге коло UA + Європа). */
+export const MAP_CITY_PAGES: CityPage[] = [...CITY_PAGES, ...UA_CITY2_PAGES, ...WORLD_CITY_PAGES];
+
+export const MAP_CITY_PAGE_BY_SLUG: Record<string, CityPage> = Object.fromEntries(
+  MAP_CITY_PAGES.map((c) => [c.slug, c]),
+);
+
+/** true — місто поза Україною (нема районів-шаблонів і брелок-сторінки). */
+export function isWorldCity(slug: string): boolean {
+  return Boolean(WORLD_CITY_BY_SLUG[slug]);
+}

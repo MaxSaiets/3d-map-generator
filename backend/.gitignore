@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+
+# Output files
+output/
+*.stl
+*.3mf
+
+# Приватні рантайм-дані (users.json/orders.jsonl/analytics.jsonl/panel_batches.json)
+# — НЕ в репо (раніше потрапили в bridge → деплой-pull падав конфліктом).
+data/
+
+# Node
+node_modules/
+.next/
+out/
+build/
+dist/
+
+# Environment
+.env
+.env.local
+.env*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Testing
+.coverage
+.pytest_cache/
+htmlcov/
+
+
+cache/
+
+
+# FIREBASE
+serviceAccountKey.json
+serviceAccountKey
+# Ваги нейромережі планів — 55 МБ, у git не їдуть. На сервер копіюються
+# окремо (scp у backend/models/). Без файлу сервіс /maket автоматично
+# працює класичним CV — це робочий стан, а не помилка.
+models/*.onnx

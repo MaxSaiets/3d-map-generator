@@ -1,0 +1,295 @@
+"""Оплачений доступ до друк-файлу (рішення власника 09.09.2026: 149 ₴).
+
+Навіщо це існує (заміряно за 30 днів): модель створили 23 людини, з них лише 8 з
+України. Друк і доставка — тільки по Україні, тож дві третини тих, хто робить усю
+роботу зі створення мапи, не мали що купити. Файл не має логістики й митниці.
+
+Головне правило, яке тримають ці тести: **оплата не витрачає безкоштовну квоту**.
+Покупець не має платити двічі — грошима і своїм безкоштовним завантаженням.
+"""
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from services import file_access as fa
+
+
+@pytest.fixture(autouse=True)
+def access_log(tmp_path, monkeypatch):
+    monkeypatch.setattr(fa, "ACCESS_LOG", tmp_path / "file_access.jsonl")
+    yield tmp_path / "file_access.jsonl"
+
+
+# ── ціна ─────────────────────────────────────────────────────────────────────
+
+def test_price_defaults_to_the_owners_decision(monkeypatch, tmp_path):
+    monkeypatch.delenv("FILE_PRICE_UAH", raising=False)
+    monkeypatch.setattr(fa, "PRICING_PATH", tmp_path / "нема.json")
+    assert fa.file_price_uah() == 149
+
+
+def test_price_comes_from_pricing_json(monkeypatch, tmp_path):
+    monkeypatch.delenv("FILE_PRICE_UAH", raising=False)
+    p = tmp_path / "pricing.json"
+    p.write_text(json.dumps({"file": {"price": 199}}), encoding="utf-8")
+    monkeypatch.setattr(fa, "PRICING_PATH", p)
+    assert fa.file_price_uah() == 199, "ціна має правитись у pricing.json без релізу"
+
+
+def test_env_overrides_pricing(monkeypatch, tmp_path):
+    p = tmp_path / "pricing.json"
+    p.write_text(json.dumps({"file": {"price": 199}}), encoding="utf-8")
+    monkeypatch.setattr(fa, "PRICING_PATH", p)
+    monkeypatch.setenv("FILE_PRICE_UAH", "99")
+    assert fa.file_price_uah() == 99
+
+
+def test_broken_pricing_file_does_not_break_checkout(monkeypatch, tmp_path):
+    monkeypatch.delenv("FILE_PRICE_UAH", raising=False)
+    p = tmp_path / "pricing.json"
+    p.write_text("{ це не json", encoding="utf-8")
+    monkeypatch.setattr(fa, "PRICING_PATH", p)
+    assert fa.file_price_uah() == 149
+
+
+# ── доступ ───────────────────────────────────────────────────────────────────
+
+def test_grant_then_access():
+    assert fa.has_access("t1") is False
+    assert fa.grant("t1", order_number="7001", email="A@B.com", amount=149) is True
+    assert fa.has_access("t1") is True
+    assert fa.has_access("t2") is False, "доступ дається на КОНКРЕТНУ модель"
+
+
+def test_grant_is_idempotent(access_log):
+    assert fa.grant("t1", order_number="7001") is True
+    assert fa.grant("t1", order_number="7001") is False, "повтор не має дублювати запис"
+    lines = [l for l in access_log.read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert len(lines) == 1
+
+
+def test_no_task_id_grants_nothing():
+    for bad in ("", "   ", None):
+        assert fa.grant(bad) is False          # type: ignore[arg-type]
+    assert fa.has_access("") is False
+    assert fa.has_access(None) is False
+
+
+def test_email_is_normalised_and_searchable():
+    fa.grant("t1", email="  Owner@Example.COM ")
+    fa.grant("t2", email="other@example.com")
+    assert fa.list_for_email("owner@example.com") == ["t1"]
+    assert fa.list_for_email("OWNER@EXAMPLE.COM") == ["t1"]
+    assert fa.list_for_email("") == []
+
+
+def test_broken_line_does_not_hide_other_grants(access_log):
+    fa.grant("t1")
+    with access_log.open("a", encoding="utf-8") as fh:
+        fh.write("{побитий рядок\n")
+    fa.grant("t2")
+    assert fa.has_access("t1") is True
+    assert fa.has_access("t2") is True
+
+
+def test_missing_log_means_no_access(access_log):
+    assert not access_log.exists()
+    assert fa.has_access("t1") is False        # і не падає
+
+
+# ── звʼязок з оплатою ────────────────────────────────────────────────────────
+
+def test_paid_order_opens_access_to_its_model(tmp_path, monkeypatch):
+    """`mark_order_paid` — ЄДИНА точка підтвердження оплати (її кличуть і
+    webhook LiqPay, і опитування статусу зі сторінки-подяки), тож хук саме там."""
+    from services import order_service as os_mod
+
+    log = tmp_path / "orders.jsonl"
+    log.write_text(
+        json.dumps({"order_number": "7001", "status": "pending_payment",
+                    "task_id": "task-abc", "email": "buyer@example.com"}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(os_mod, "ORDERS_LOG", log)
+    monkeypatch.setattr(os_mod, "telegram_configured", lambda: False)
+
+    assert fa.has_access("task-abc") is False
+    os_mod.mark_order_paid("7001", {"status": "success", "amount": 149, "currency": "UAH"})
+    assert fa.has_access("task-abc") is True, "оплата має відкривати доступ до файлу"
+
+
+def test_unpaid_order_opens_nothing(tmp_path, monkeypatch):
+    from services import order_service as os_mod
+
+    log = tmp_path / "orders.jsonl"
+    log.write_text(
+        json.dumps({"order_number": "7002", "status": "pending_payment",
+                    "task_id": "task-xyz"}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(os_mod, "ORDERS_LOG", log)
+    monkeypatch.setattr(os_mod, "telegram_configured", lambda: False)
+
+    os_mod.mark_order_paid("7002", {"status": "failure", "amount": 149})
+    assert fa.has_access("task-xyz") is False
+
+
+def test_find_order_record_takes_the_latest_version(tmp_path, monkeypatch):
+    """Журнал дописуваний: `set_order_status` і `attach_payment` перезаписують
+    запис новим рядком. Актуальний — останній."""
+    from services import order_service as os_mod
+
+    log = tmp_path / "orders.jsonl"
+    log.write_text("\n".join([
+        json.dumps({"order_number": "7003", "status": "new", "task_id": "старий"}, ensure_ascii=False),
+        json.dumps({"type": "payment", "order_number": "7003", "paid": False}, ensure_ascii=False),
+        json.dumps({"order_number": "7003", "status": "pending_payment", "task_id": "новий"}, ensure_ascii=False),
+    ]) + "\n", encoding="utf-8")
+    monkeypatch.setattr(os_mod, "ORDERS_LOG", log)
+
+    rec = os_mod.find_order_record("7003")
+    assert rec is not None and rec["task_id"] == "новий"
+    assert os_mod.find_order_record("9999") is None
+
+# ── ендпоінти ────────────────────────────────────────────────────────────────
+
+def test_access_endpoint_reports_price_and_state(monkeypatch):
+    from fastapi.testclient import TestClient
+    import main
+
+    monkeypatch.setattr(main, "tasks", getattr(main, "tasks", {}), raising=False)
+    c = TestClient(main.app)
+
+    r = c.get("/api/file/access/task-none")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["paid"] is False
+    assert body["priceUah"] > 0 and body["currency"] == "UAH"
+
+    fa.grant("task-paid", order_number="1")
+    assert c.get("/api/file/access/task-paid").json()["paid"] is True
+
+
+def test_checkout_rejects_a_broken_email():
+    from fastapi.testclient import TestClient
+    import main
+
+    c = TestClient(main.app)
+    # «@example.com» проходило першу версію перевірки й доходило до створення
+    # замовлення — саме цей рядок і зловив діру.
+    for bad in ("", "   ", "не пошта", "a@b", "@example.com", "a@.com",
+                "a@example.", "a b@example.com", "a@@example.com"):
+        r = c.post("/api/file/checkout", json={"task_id": "task-1", "email": bad})
+        assert r.status_code == 422, (bad, r.status_code, r.text[:120])
+
+
+def test_checkout_does_not_charge_twice():
+    """Людина повернулась за посиланням на вже куплений файл — грошей не беремо."""
+    from fastapi.testclient import TestClient
+    import main
+
+    fa.grant("task-paid-2", order_number="2")
+    c = TestClient(main.app)
+    r = c.post("/api/file/checkout", json={"task_id": "task-paid-2", "email": "a@example.com"})
+    assert r.status_code == 200
+    assert r.json() == {"alreadyPaid": True, "taskId": "task-paid-2"}
+
+def test_unpaid_file_is_not_served():
+    """Головний замок: без оплати файл не віддається, і це 402 — зрозумілий код,
+    на який фронт покаже пропозицію купити, а не «щось пішло не так»."""
+    from fastapi.testclient import TestClient
+    import main
+
+    c = TestClient(main.app)
+    r = c.get("/api/file/download/task-unpaid")
+    assert r.status_code == 402, r.status_code
+
+
+def test_paid_but_missing_file_says_so_honestly():
+    """Оплата є, файлу на диску немає — це НАШ борг. Покупець має побачити, що
+    робити далі, а не голе 404."""
+    from fastapi.testclient import TestClient
+    import main
+
+    fa.grant("task-paid-no-file", order_number="9")
+    c = TestClient(main.app)
+    r = c.get("/api/file/download/task-paid-no-file")
+    assert r.status_code == 404
+    assert "оплачено" in r.json()["detail"].lower()
+
+
+def test_payment_status_returns_the_task_to_download(monkeypatch, tmp_path):
+    """Сторінка-подяка мусить знати, ЩО качати після оплати файлу."""
+    from fastapi.testclient import TestClient
+    import main
+    from services import order_service as os_mod, liqpay as lp
+
+    log = tmp_path / "orders.jsonl"
+    log.write_text(
+        json.dumps({"order_number": "7100", "status": "pending_payment",
+                    "task_id": "task-7100"}, ensure_ascii=False) + chr(10),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(os_mod, "ORDERS_LOG", log)
+    monkeypatch.setattr(os_mod, "telegram_configured", lambda: False)
+    monkeypatch.setattr(lp, "is_configured", lambda: True)
+    monkeypatch.setattr(lp, "query_status", lambda oid: {"status": "success", "amount": 149, "currency": "UAH"})
+
+    c = TestClient(main.app)
+    body = c.get("/api/liqpay/status/7100").json()
+    assert body["paid"] is True
+    assert body["task_id"] == "task-7100", body
+    # і оплата справді відкрила доступ
+    assert fa.has_access("task-7100") is True
+
+def test_buyer_email_survives_to_the_grant(tmp_path, monkeypatch):
+    """Наскрізна перевірка на СПРАВЖНЬОМУ `create_order` виявила розрив: запис
+    замовлення зберігає поле `user_email`, а чек слав `email` — пошта покупця
+    губилась, і знайти, ХТО купив файл, не було чим. Виявилось би лише після
+    першої реальної продажі, коли людина загубила б посилання."""
+    from services import order_service as os_mod
+
+    log = tmp_path / "orders.jsonl"
+    monkeypatch.setattr(os_mod, "ORDERS_LOG", log)
+    monkeypatch.setattr(os_mod, "telegram_configured", lambda: False)
+
+    order = os_mod.create_order({
+        "name": "buyer", "phone": "", "email": "buyer@example.com",
+        "user_email": "buyer@example.com", "product_type": "file",
+        "task_id": "task-mail", "summary": {},
+    })
+    num = str(order["order_number"])
+    os_mod.mark_order_paid(num, {"status": "success", "amount": 149, "currency": "UAH"})
+
+    assert fa.has_access("task-mail") is True
+    assert fa.list_for_email("buyer@example.com") == ["task-mail"], (
+        "пошта покупця не дійшла до запису доступу"
+    )
+
+
+def test_price_hints_from_pricing_json(tmp_path, monkeypatch):
+    """«149 ₴» іноземцю ні про що не говорить — поруч має бути «≈ 3 €» (курси з pricing.json/fx)."""
+    from services import file_access as fa
+
+    p = tmp_path / "pricing.json"
+    p.write_text('{"file": {"price": 149}, "fx": {"uah_per_eur": 48.0, "uah_per_usd": 41.5}}', encoding="utf-8")
+    monkeypatch.setattr(fa, "PRICING_PATH", p)
+    monkeypatch.delenv("FILE_PRICE_UAH", raising=False)
+    assert fa.file_price_hints() == {"EUR": 3.1, "USD": 3.6}
+    p.write_text('{"file": {"price": 149}}', encoding="utf-8")
+    assert fa.file_price_hints() == {}, "без курсів — без підказки, а не 0 €"
+
+
+def test_access_follows_cache_key_after_regeneration(tmp_path, monkeypatch):
+    """Оплачений файл під новим task_id (кеш результатів віддав той самий файл) —
+    досі оплачений; покупець не платить двічі."""
+    from services import file_access as fa
+
+    monkeypatch.setattr(fa, "ACCESS_LOG", tmp_path / "file_access.jsonl")
+    assert fa.grant("task-A", order_number="1", email="a@b.co", amount=149, cache_key="ck-1")
+    assert fa.has_access("task-A")
+    assert fa.has_access("task-B", "ck-1"), "ті самі параметри → той самий файл → доступ є"
+    assert not fa.has_access("task-B"), "без cache_key чужий task_id не проходить"
+    assert not fa.has_access("task-C", "ck-2")

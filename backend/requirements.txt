@@ -1,0 +1,68 @@
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+pydantic>=2.5.3
+osmnx>=1.7.0
+geopandas>=0.14.1
+shapely>=2.0.2
+trimesh>=4.0.5
+numpy>=1.26.0,<2.0.0
+rasterio>=1.3.9
+networkx>=3.2.1
+mapbox-earcut>=1.0.1
+python-jose[cryptography]>=3.3.0
+python-dotenv>=1.0.1
+aiofiles>=23.2.1
+pydantic-settings>=2.1.0
+requests>=2.31.0
+lxml>=5.1.0
+scipy>=1.11.4
+Pillow>=10.2.0
+matplotlib>=3.8.0
+pyrosm>=0.6.2
+duckdb>=1.0.0
+pyarrow>=16.1.0
+pyogrio>=0.10.0
+# triangle ВИДАЛЕНО: C-бібліотека Шевчука СЕГФОЛТИТЬ на вироджених PSLG і ЖОРСТКО
+# вбиває бекенд (сегфолт не ловиться try/except) → «Помилка генерації». Код скрізь
+# має безпечний fallback (scipy-grid / earcut / manifold). НЕ повертати без ізоляції
+# у субпроцес. Див. mesh_triangulation.extrude_polygon_quality (вимкнено).
+firebase-admin>=6.2.0
+open3d>=0.17.0
+httpx>=0.25.0
+
+# ── Сервіс «макет квартири» (services/floorplan/*) ──────────────────────────
+# ВЕРХНІ МЕЖІ ТУТ НЕ ДЕКОРАТИВНІ: opencv-python-headless 5.x ВИМАГАЄ numpy>=2,
+# а вище стоїть пін numpy<2.0.0 для решти пайплайну. Знімеш стелю — pip тихо
+# підніме numpy і зламає генерацію мап.
+# СТЕЛЯ 4.10.x, А НЕ <5: opencv 4.14 уже вимагає numpy>=2 і при install
+# ТИХО зносить numpy 1.26 — перевірено на проді 02.08.2026, генерація мап
+# лягла б після першого рестарту. Піднімати лише разом із numpy.
+opencv-python-headless>=4.9,<4.11
+scikit-image>=0.22,<0.25          # 0.25 тягне numpy>=2 (та сама причина)
+# manifold3d приходив як необов'язковий extra trimesh; тепер від нього прямо
+# залежить булеве віднімання вікон — фіксуємо явно.
+manifold3d>=2.5
+# PDF: pypdfium2 = BSD-3, pdfplumber = MIT.
+# ⛔ НЕ ставити PyMuPDF/fitz: AGPL-3.0 (або ліцензія Artifex за $10k+/рік) —
+# для платного сервісу це означає обов'язок відкрити весь бекенд.
+pypdfium2>=4.30
+pdfplumber>=0.11
+# Інференс сегментатора планів на CPU. Ваг у репозиторії немає — без файлу
+# models/floorplan_seg.onnx сервіс автоматично працює класичним CV.
+onnxruntime>=1.17,<2
+
+# ── OCR розмірних ланцюжків ─────────────────────────────────────────────────
+# Читає числа на кресленні («3 500», «4 680») і визначає масштаб з них — це
+# ЄДИНИЙ спосіб отримати правильний розмір без участі людини. Без нього масштаб
+# береться з ширини дверей (~15% похибки) або з припущення, і на планах
+# власника квартира виходила вдвічі більшою за справжню.
+#
+# ⚠️ СТАВИТИ З --no-deps, інакше притягне звичайний opencv-python поруч із
+# headless (задокументована поломка). Залежності доставляються поштучно, теж
+# із --no-deps; antlr4 ОБОВ'ЯЗКОВО 4.9.x — на 4.13 omegaconf падає з
+# «Could not deserialize ATN with version 3».
+#     pip install --no-deps rapidocr omegaconf colorlog tqdm pyclipper
+#     pip install --no-deps 'antlr4-python3-runtime==4.9.3'
+# Ваги (~46 МБ) тягнуться при першому запуску — прогрівати на деплої.
+

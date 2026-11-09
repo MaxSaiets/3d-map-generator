@@ -1,0 +1,278 @@
+"""Unit tests for main._aggregate_analytics — pure aggregation over raw
+analytics.jsonl lines, used by /api/admin/stats. Exercises the per-visitor
+timeline and the guided-flow "choices" aggregates."""
+from __future__ import annotations
+
+import json
+from datetime import datetime, timedelta, timezone
+
+import main as app_main
+
+
+def _line(event, path="", props=None, visitor="vis1", day=None, ts=None, cc="UA"):
+    now = datetime.now(timezone.utc)
+    day = day or now.strftime("%Y-%m-%d")
+    ts = ts or now.isoformat(timespec="seconds")
+    rec = {
+        "ts": ts, "day": day, "event": event, "path": path,
+        "locale": "uk", "ref": "", "visitor": visitor, "cc": cc,
+    }
+    if props is not None:
+        rec["props"] = {str(k): str(v) for k, v in props.items()}
+    return json.dumps(rec, ensure_ascii=False)
+
+
+def test_basic_totals_and_pageviews():
+    lines = [
+        _line("pageview", path="/"),
+        _line("pageview", path="/create"),
+        _line("ping"),
+    ]
+    agg = app_main._aggregate_analytics(lines, 30)
+    assert agg["totals"]["pageviews"] == 2
+    # ping doesn't count toward events
+    assert agg["totals"]["events"] == 2
+    assert agg["totals"]["uniqueVisitors"] == 1
+
+
+def test_timeline_excludes_ping_and_untargeted_clicks():
+    lines = [
+        _line("pageview", path="/create"),
+        _line("ping"),
+        _line("click", props={}),  # no el -> excluded
+        _line("click", props={"el": "buy-button"}),  # has el -> included
+        _line("guided_step", props={"step": "2", "product": "map"}),
+    ]
+    agg = app_main._aggregate_analytics(lines, 30)
+    tl = agg["recentVisitors"][0]["timeline"]
+    events = [item["e"] for item in tl]
+    assert "ping" not in events
+    assert events.count("click") == 1
+    assert "guided_step" in events
+    assert "pageview" in events
+    click_item = next(i for i in tl if i["e"] == "click")
+    assert click_item["p"] == {"el": "buy-button"}
+
+
+def test_timeline_caps_clicks_at_8_per_visitor():
+    lines = [_line("click", props={"el": f"btn{i}"}) for i in range(12)]
+    agg = app_main._aggregate_analytics(lines, 30)
+    tl = agg["recentVisitors"][0]["timeline"]
+    assert sum(1 for i in tl if i["e"] == "click") == 8
+
+
+def test_timeline_caps_total_at_40():
+    lines = [_line("guided_step", props={"step": str(i)}) for i in range(55)]
+    agg = app_main._aggregate_analytics(lines, 30)
+    tl = agg["recentVisitors"][0]["timeline"]
+    assert len(tl) == 40
+    # keeps the LAST 40 (most recent), so step "54" survives, step "0" doesn't.
+    steps = [i["p"].get("step") for i in tl]
+    assert "54" in steps
+    assert "0" not in steps
+
+
+def test_timeline_prop_subset_only_keeps_known_keys():
+    lines = [
+        _line("guided_generate", props={
+            "product": "map", "sizeMm": "150", "place": "kyiv",
+            "placePicked": "True", "secretUnknownField": "xxx",
+        }),
+    ]
+    agg = app_main._aggregate_analytics(lines, 30)
+    item = agg["recentVisitors"][0]["timeline"][0]
+    assert item["e"] == "guided_generate"
+    assert "secretUnknownField" not in item["p"]
+    assert item["p"]["sizeMm"] == "150"
+    assert item["p"]["place"] == "kyiv"
+
+
+def test_guided_choices_sizes_places():
+    lines = [
+        _line("guided_size", props={"sizeMm": "150"}),
+        _line("guided_generate", props={"sizeMm": "150", "place": "Kyiv", "placePicked": "True"}),
+        _line("guided_place", props={"place": "Lviv"}),
+        _line("guided_place", props={"place": ""}),  # empty -> skipped
+    ]
+    agg = app_main._aggregate_analytics(lines, 30)
+    choices = agg["guided"]["choices"]
+    sizes = dict(choices["sizes"])
+    places = dict(choices["places"])
+    assert sizes.get("150") == 2
+    assert places.get("Kyiv") == 1
+    assert places.get("Lviv") == 1
+    assert "" not in places
+
+
+def test_guided_choices_home_share_download_order_results():
+    lines = [
+        _line("guided_home", props={"action": "mark"}),
+        _line("guided_home", props={"action": "unmark"}),
+        _line("guided_share", props={}),
+        _line("guided_download", props={}),
+        _line("download_model", props={}),
+        _line("guided_order_click", props={}),
+        _line("guided_result", props={"ok": "True"}),
+        _line("guided_result", props={"ok": "false"}),
+        _line("guided_result", props={}),
+    ]
+    agg = app_main._aggregate_analytics(lines, 30)
+    choices = agg["guided"]["choices"]
+    assert choices["homeMarked"] == 1
+    assert choices["shares"] == 1
+    assert choices["downloads"] == 2
+    assert choices["orderClicks"] == 1
+    assert choices["results"] == {"ok": 1, "fail": 2}
+
+
+def test_guided_events_respect_days_cutoff():
+    old_day = (datetime.now(timezone.utc) - timedelta(days=100)).strftime("%Y-%m-%d")
+    lines = [
+        _line("guided_size", props={"sizeMm": "999"}, day=old_day,
+              ts=(datetime.now(timezone.utc) - timedelta(days=100)).isoformat(timespec="seconds")),
+        _line("guided_size", props={"sizeMm": "150"}),
+    ]
+    agg = app_main._aggregate_analytics(lines, 30)
+    sizes = dict(agg["guided"]["choices"]["sizes"])
+    assert "999" not in sizes
+    assert sizes.get("150") == 1
+
+
+def test_multiple_visitors_get_separate_timelines():
+    lines = [
+        _line("pageview", path="/a", visitor="visA"),
+        _line("pageview", path="/b", visitor="visB"),
+    ]
+    agg = app_main._aggregate_analytics(lines, 30)
+    assert len(agg["recentVisitors"]) == 2
+    ids = {v["id"] for v in agg["recentVisitors"]}
+    assert len(ids) == 2
+
+
+def test_ab_split_counts_milestones_per_variant():
+    lines = [
+        # visitor A1: variant A, reaches view + generate
+        _line("funnel", props={"step": "view", "ab_cta": "A"}, visitor="a1"),
+        _line("funnel", props={"step": "generate", "ab_cta": "A"}, visitor="a1"),
+        # visitor A2: variant A, only view
+        _line("funnel", props={"step": "view", "ab_cta": "A"}, visitor="a2"),
+        # visitor B1: variant B, reaches everything through paid
+        _line("guided_step", props={"ab_cta": "B"}, visitor="b1"),
+        _line("guided_generate", props={"ab_cta": "B"}, visitor="b1"),
+        _line("guided_result", props={"ok": "True", "ab_cta": "B"}, visitor="b1"),
+        _line("guided_order_click", props={"ab_cta": "B"}, visitor="b1"),
+        _line("funnel", props={"step": "order_submit", "ab_cta": "B"}, visitor="b1"),
+        _line("order_paid_confirmed", props={"ab_cta": "B"}, visitor="b1"),
+    ]
+    agg = app_main._aggregate_analytics(lines, 30)
+    ab = agg["ab"]["cta"]
+    assert ab["A"] == {
+        "visitors": 2, "view": 2, "generate": 1, "result_ok": 0,
+        "order_click": 0, "order_submit": 0, "paid": 0,
+    }
+    assert ab["B"] == {
+        "visitors": 1, "view": 1, "generate": 1, "result_ok": 1,
+        "order_click": 1, "order_submit": 1, "paid": 1,
+    }
+
+
+def test_ab_split_visitor_uniqueness_across_events():
+    """Same visitor firing the same milestone twice must not double-count."""
+    lines = [
+        _line("funnel", props={"step": "view", "ab_cta": "A"}, visitor="v1"),
+        _line("funnel", props={"step": "view", "ab_cta": "A"}, visitor="v1"),
+        _line("funnel", props={"step": "generate", "ab_cta": "A"}, visitor="v1"),
+    ]
+    agg = app_main._aggregate_analytics(lines, 30)
+    ab = agg["ab"]["cta"]["A"]
+    assert ab["visitors"] == 1
+    assert ab["view"] == 1
+    assert ab["generate"] == 1
+
+
+def test_ab_split_empty_when_no_ab_props():
+    lines = [
+        _line("pageview", path="/"),
+        _line("funnel", props={"step": "view"}),
+    ]
+    agg = app_main._aggregate_analytics(lines, 30)
+    assert agg["ab"] == {}
+
+
+def test_why_not_order_and_messenger_counted_in_choices():
+    lines = [
+        _line("why_not_order", props={"reason": "price", "product": "map"}),
+        _line("why_not_order", props={"reason": "price", "product": "map"}, visitor="v2"),
+        _line("why_not_order", props={"reason": "abroad", "product": "keychain"}, visitor="v3"),
+        _line("messenger_order", props={"channel": "tg", "product": "map"}),
+        _line("messenger_order", props={"channel": "ig", "product": "map"}, visitor="v2"),
+        # старіше за період — не рахується
+        _line("why_not_order", props={"reason": "self"}, day="2020-01-01", ts="2020-01-01T00:00:00+00:00"),
+    ]
+    agg = app_main._aggregate_analytics(lines, 30)
+    ch = agg["guided"]["choices"]
+    assert ch["whyNotOrder"] == [["price", 2], ["abroad", 1]] or ch["whyNotOrder"] == [("price", 2), ("abroad", 1)]
+    assert sorted(tuple(x) for x in ch["messenger"]) == [("ig", 1), ("tg", 1)]
+
+
+def test_period_filter_applies_to_all_aggregates_not_only_guided():
+    """⭐Регрес 08.09.2026: `days` застосовувався лише до guided-блоку, а
+    totals/topPaths/byCountry/funnel/recentVisitors рахувались ЗА ВЕСЬ ЧАС.
+    Тижневий дайджест через це показував 254 «відвідувачі за 7 днів» замість
+    реальних 35, а перемикач періоду в адмінці майже нічого не міняв."""
+    old_day = "2020-01-01"
+    old_ts = "2020-01-01T00:00:00+00:00"
+    lines = [
+        # старе — має бути ВІДКИНУТЕ повністю
+        _line("pageview", path="/old", visitor="old1", day=old_day, ts=old_ts, cc="PL"),
+        _line("pageview", path="/old", visitor="old2", day=old_day, ts=old_ts, cc="PL"),
+        _line("funnel", props={"step": "view"}, visitor="old1", day=old_day, ts=old_ts),
+        # свіже
+        _line("pageview", path="/create", visitor="new1"),
+        _line("funnel", props={"step": "view"}, visitor="new1"),
+    ]
+    agg = app_main._aggregate_analytics(lines, 30)
+    assert agg["totals"]["uniqueVisitors"] == 1, "старі відвідувачі потрапили в підсумок"
+    assert agg["totals"]["pageviews"] == 1
+    paths = dict(agg["topPaths"])
+    assert "/old" not in paths and paths.get("/create") == 1
+    assert "PL" not in dict(agg["byCountry"])
+    funnel = {s["step"]: s["count"] for s in agg["funnel"]}
+    assert funnel.get("view") == 1
+    assert all(v["id"] != "old1" for v in agg["recentVisitors"])
+
+
+def test_download_reclick_counted():
+    """`download_reclick` = клік «Завантажити», який захист від rage-click
+    проігнорував. Прод 07.09: один відвідувач дав 31 клік → 35 генерацій; після
+    фіксу ці кліки мають з'являтись саме тут, а не як нові генерації."""
+    lines = [
+        _line("download_reclick", props={"product": "map"}),
+        _line("download_reclick", props={"product": "map"}, visitor="v2"),
+        _line("download_wait", props={"product": "map"}),
+    ]
+    agg = app_main._aggregate_analytics(lines, 30)
+    assert agg["guided"]["downloadReclicks"] == 2
+    assert agg["guided"]["downloadWait"] == 1
+
+
+def test_pro_funnel_counts_views_ctas_and_checkouts():
+    """07.10.2026: воронка підписки — унікальні відвідувачі /pro (будь-яка локаль),
+    кліки «Pro» за місцем і унікальні, хто дійшов до оплати. /prices чи /pro-terms
+    не рахуються як перегляд /pro."""
+    lines = [
+        _line("pageview", path="/pro", visitor="a"),
+        _line("pageview", path="/en/pro", visitor="b"),
+        _line("pageview", path="/pro", visitor="a"),
+        _line("pageview", path="/pro-terms", visitor="c"),
+        _line("pageview", path="/prices", visitor="c"),
+        _line("pro_cta", props={"place": "buy_file"}, visitor="a"),
+        _line("pro_cta", props={"place": "buy_file"}, visitor="b"),
+        _line("pro_cta", props={"place": "account"}, visitor="b"),
+        _line("pro_checkout", props={"currency": "UAH"}, visitor="a"),
+        _line("pro_checkout", props={"currency": "UAH"}, visitor="a"),
+    ]
+    pro = app_main._aggregate_analytics(lines, 30)["guided"]["pro"]
+    assert pro["viewPeople"] == 2
+    assert dict(pro["cta"]) == {"buy_file": 2, "account": 1}
+    assert pro["checkoutPeople"] == 1

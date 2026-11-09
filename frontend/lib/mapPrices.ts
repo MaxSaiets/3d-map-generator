@@ -1,0 +1,142 @@
+// ──────────────────────────────────────────────────────────────────────────
+// ЄДИНЕ ДЖЕРЕЛО ПРАВДИ для цін МАПИ на фронті.
+// ⚠ ТРИМАТИ В СИНХРОНІ з backend/pricing.json → map.sizes_mm (жива ціна йде з
+// /api/quote; це fallback + structured-data). Усе нижче (SIMPLE_SIZES у
+// generation.ts, AggregateOffer на 138 city-pages, create/keychains LD-схеми)
+// читає ОДНУ цю таблицю, щоб ціни не «дрейфували» між місцями (Google Merchant
+// «price mismatch» + розбіжність UI vs реальний прайс).
+//
+// Як змінити ціни:
+//   1) backend/pricing.json → map.sizes_mm (runtime-джерело, оператор бачить)
+//   2) MAP_SIZE_PRICES_UAH нижче (фронт-fallback + SEO) — мають збігатися
+// ──────────────────────────────────────────────────────────────────────────
+
+/** Канонічна таблиця ЦІН МАПИ за розміром: ребро моделі (мм) → ціна (UAH).
+ *  Дзеркало backend/pricing.json → map.sizes_mm. 60мм = магніт (окремий SKU,
+ *  не входить у звичайну S/M/L/XL лінійку, тому тут немає). */
+export const MAP_SIZE_PRICES_UAH = {
+  55: 350,   // S  (5.5 см)   2026-10-19: база+площа, 20 см = 2000 (рішення власника)
+  80: 500,   // M  (8 см)               (до того 2026-09-08: 350/490/630/770)
+  110: 750,  // L  (11 см)
+  150: 1250, // XL (15 см)
+  200: 2000, // 20 см
+} as const;
+
+export type MapSizeMm = keyof typeof MAP_SIZE_PRICES_UAH;
+
+/** Ціна для БУДЬ-ЯКОГО розміру (guided-повзунок 50–200 мм, «Профі» до 500):
+ *  лінійно між сусідніми тарифами, нижче S = S, вище 20 см — продовжуємо нахил
+ *  останнього відрізка (150→200 = 15 ₴/мм); округлення до 10 ₴. БЕЗ знижки. ДЗЕРКАЛО
+ *  backend main.py `_map_price_for_size` (жива ціна йде з /api/quote; це fallback). */
+export function mapPriceForSizeUah(sizeMm: number): number {
+  return curvePriceUah(MAP_SIZE_PRICES_UAH, sizeMm);
+}
+
+function curvePriceUah(table: Record<number, number>, sizeMm: number): number {
+  const pts = Object.keys(table).map(Number).sort((a, b) => a - b);
+  const price = (mm: number) => table[mm];
+  if (!Number.isFinite(sizeMm) || sizeMm <= pts[0]) return price(pts[0]);
+  const last = pts[pts.length - 1];
+  if (sizeMm >= last) {
+    const prev = pts[pts.length - 2];
+    const slope = (price(last) - price(prev)) / (last - prev);
+    return Math.round((price(last) + slope * (sizeMm - last)) / 10) * 10;
+  }
+  for (let i = 1; i < pts.length; i++) {
+    if (sizeMm <= pts[i]) {
+      const a = pts[i - 1], b = pts[i];
+      const k = (sizeMm - a) / (b - a);
+      return Math.round((price(a) + k * (price(b) - price(a))) / 10) * 10;
+    }
+  }
+  return price(last);
+}
+
+/** Магніт-мапа (60мм) — окремий SKU. UAH. Дзеркало pricing.json map.sizes_mm["60"]. */
+export const MAP_MAGNET_PRICE_UAH = 210;
+
+/** Брелок-мапа (3D-друк) — базова ціна. UAH. Дзеркало pricing.json keychain.base. */
+export const KEYCHAIN_PRICE_UAH = 170;
+
+/** Макет квартири з плану — ціна за ФІЗИЧНИМ розміром виробу (мм → UAH).
+ *  Дзеркало backend/pricing.json → floorplan.sizes_mm. Покупець обирає
+ *  сантиметри, а не архітектурний масштаб — так само роблять Etsy-продавці. */
+export const FLOORPLAN_SIZE_PRICES_UAH = {
+  100: 830,
+  150: 1250,
+  200: 1810,
+  250: 2510,
+} as const;
+
+export type FloorplanSizeMm = keyof typeof FLOORPLAN_SIZE_PRICES_UAH;
+
+export function floorplanPriceUah(sizeMm: number): number {
+  const sizes = Object.keys(FLOORPLAN_SIZE_PRICES_UAH).map(Number);
+  const nearest = sizes.reduce((a, b) => (Math.abs(b - sizeMm) < Math.abs(a - sizeMm) ? b : a));
+  return FLOORPLAN_SIZE_PRICES_UAH[nearest as FloorplanSizeMm];
+}
+
+/** Надбавка за рельєф — «від» (найменший розмір). UAH. Дзеркало pricing.json map.relief_addon. */
+export const MAP_RELIEF_ADDON_UAH = 100;
+
+/** Надбавка за рельєф ЗА РОЗМІРОМ (19.10.2026: 20 см = 2000 → 3000 з рельєфом).
+ *  Дзеркало pricing.json map.relief_addon_mm; проміжні — лінійно. */
+export const MAP_RELIEF_ADDON_BY_MM_UAH = {
+  55: 100,
+  80: 180,
+  110: 320,
+  150: 580,
+  200: 1000,
+} as const;
+
+export function mapReliefAddonUah(sizeMm: number): number {
+  return curvePriceUah(MAP_RELIEF_ADDON_BY_MM_UAH, sizeMm);
+}
+
+/** Знижка лише від 20 см (власник 19.10.2026): стара ціна перекреслена +
+ *  плашка «Зараз діє знижка». Дзеркало pricing.json map.discount. */
+export const MAP_DISCOUNT = { minSizeMm: 200, amountUah: 350 } as const;
+
+/** Ціна мапи: list — без знижки (для перекреслення), price — до сплати.
+ *  Дзеркало backend main.py `_map_list_and_price`. */
+export function mapQuoteUah(sizeMm: number, relief: boolean): { list: number; price: number } {
+  const list = mapPriceForSizeUah(sizeMm) + (relief ? mapReliefAddonUah(sizeMm) : 0);
+  const price = sizeMm >= MAP_DISCOUNT.minSizeMm - 0.5 ? Math.max(0, list - MAP_DISCOUNT.amountUah) : list;
+  return { list, price };
+}
+
+/** Один друк-файл (3MF/STL) без підписки. UAH. Дзеркало pricing.json file.price —
+ *  статичний fallback для /prices і /pro; живу ціну /pro бере з /api/subscription/plans. */
+export const FILE_PRICE_UAH = 149;
+
+/** З якого файлу на місяць підписка дешевша за поштучну купівлю (2100 / 149 → 15-й). */
+export function breakEvenFiles(subPrice: number, filePrice: number): number {
+  if (!(filePrice > 0)) return 1;
+  return Math.floor(subPrice / filePrice) + 1;
+}
+
+/** Позиційний курс UAH→EUR (як на лендінгу, НЕ біржовий ФХ). Округлюємо до
+ *  «гарних» євро (350₴≈8€, 770₴≈18€). */
+export const EUR_PER_UAH = 0.024;
+
+/** Ціна розміру у EUR (позиційний курс, округлення до цілого євро). */
+export function mapPriceEur(uah: number): number {
+  return Math.round(uah * EUR_PER_UAH);
+}
+
+const _uahValues = Object.values(MAP_SIZE_PRICES_UAH);
+const _lowUah = Math.min(..._uahValues);
+const _highUah = Math.max(..._uahValues);
+
+// Діапазон цін для structured-data (AggregateOffer). Виводиться з таблиці вище —
+// одна зміна ціни оновлює і UI, і SEO одночасно.
+export const MAP_PRICE_RANGE = {
+  offerCount: String(_uahValues.length),
+  uk: { currency: "UAH", low: String(_lowUah), high: String(_highUah) },
+  eu: { currency: "EUR", low: String(mapPriceEur(_lowUah)), high: String(mapPriceEur(_highUah)) },
+} as const;
+
+export function mapPriceRange(locale: string) {
+  const r = locale === "uk" ? MAP_PRICE_RANGE.uk : MAP_PRICE_RANGE.eu;
+  return { ...r, offerCount: MAP_PRICE_RANGE.offerCount };
+}

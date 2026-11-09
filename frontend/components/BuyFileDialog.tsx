@@ -1,0 +1,219 @@
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+import { useTranslations, useLocale } from "next-intl";
+import { createPortal } from "react-dom";
+import { X, FileDown, Loader2, ShieldCheck } from "lucide-react";
+import { useAuth } from "@/components/AuthProvider";
+import { Link } from "@/i18n/navigation";
+import { SUB_PRICE } from "@/lib/legal/subscription";
+
+/**
+ * ⭐09.09.2026, рішення власника: друк-файл коштує 149 ₴.
+ *
+ * Навіщо окремий діалог, а не наявна форма замовлення. Заміряно за 30 днів:
+ * модель створили 23 людини, і лише 8 з України. Друк і доставка — тільки по
+ * Україні, тож дві третини тих, хто зробив усю роботу, не мали що купити.
+ * Форма замовлення просить телефон і відділення Нової Пошти, бо ВЕЗЕ виріб.
+ * Файл нікуди не везуть — потрібна лише пошта. Саме ця різниця й робить його
+ * продаваним за межі України.
+ *
+ * Ціну не хардкодимо: беремо з /api/file/access/<task>, щоб вона правилась у
+ * pricing.json без релізу.
+ */
+const API = process.env.NEXT_PUBLIC_API_URL || "";
+
+type Access = { paid: boolean; priceUah: number; currency: string; approx?: Record<string, number> };
+type Checkout = {
+  alreadyPaid: boolean;
+  orderNumber?: string;
+  priceUah?: number;
+  payment?: { action_url: string; data: string; signature: string };
+};
+
+export function BuyFileDialog({
+  taskId,
+  open,
+  onClose,
+  defaultEmail = "",
+  onAlreadyPaid,
+}: {
+  taskId: string | null | undefined;
+  open: boolean;
+  onClose: () => void;
+  defaultEmail?: string;
+  /** Файл уже оплачено — панель може одразу спробувати завантаження. */
+  onAlreadyPaid?: () => void;
+}) {
+  const t = useTranslations("scenario");
+  const locale = useLocale();
+  const { getIdToken } = useAuth();
+  const [access, setAccess] = useState<Access | null>(null);
+  const [email, setEmail] = useState(defaultEmail);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const formRef = useRef<HTMLFormElement | null>(null);
+  const [pay, setPay] = useState<Checkout["payment"] | null>(null);
+
+  useEffect(() => { setEmail((prev) => prev || defaultEmail); }, [defaultEmail]);
+
+  useEffect(() => {
+    if (!open || !taskId) return;
+    let alive = true;
+    setError(null);
+    fetch(`${API}/api/file/access/${encodeURIComponent(taskId)}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: Access | null) => { if (alive && d) setAccess(d); })
+      .catch(() => { /* ціну покажемо з відповіді чеку */ });
+    return () => { alive = false; };
+  }, [open, taskId]);
+
+  // Форму LiqPay сабмітимо лише після того, як вона з'явилась у DOM.
+  useEffect(() => { if (pay) formRef.current?.submit(); }, [pay]);
+
+  if (!open) return null;
+  // 16.09.2026: портал у body — як OrderDialog. Панель у guided-режимі живе в
+  // прихованій копії (display:none), і без порталу діалог рендерився невидимим.
+  if (typeof document === "undefined") return null;
+
+  const price = access?.priceUah ?? 0;
+  const priceLabel = price > 0 ? String(price) : "…";
+  // 16.09.2026: іноземцю «149 ₴» ні про що не говорить — поруч «≈ 3 €» (курси з
+  // pricing.json/fx на беку, приблизно). Списання — завжди в гривні.
+  const approxEur = locale !== "uk" && access?.approx?.EUR ? access.approx.EUR : null;
+
+  const buy = async () => {
+    if (!taskId || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      // Залогінений → покупка привʼязується до кабінету (там її видно й можна доплатити).
+      const token = await getIdToken().catch(() => null);
+      const res = await fetch(`${API}/api/file/checkout`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        body: JSON.stringify({ task_id: taskId, email, locale }),
+      });
+      if (res.status === 422) { setError(t("buyFileBadEmail")); return; }
+      if (!res.ok) { setError(t("buyFileError")); return; }
+      const data: Checkout = await res.json();
+      if (data.alreadyPaid) {
+        setAccess((a) => ({ paid: true, priceUah: a?.priceUah ?? price, currency: "UAH" }));
+        onAlreadyPaid?.();
+        return;
+      }
+      if (data.payment?.data && data.payment?.signature) {
+        import("@/lib/analytics").then((m) => m.track("file_checkout", { priceUah: data.priceUah })).catch(() => {});
+        setPay(data.payment);          // ефект вище надішле форму
+        return;
+      }
+      setError(t("buyFileError"));
+    } catch {
+      setError(t("buyFileError"));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return createPortal(
+    <div
+      className="fixed inset-0 z-[120] flex items-end justify-center bg-black/45 p-0 sm:items-center sm:p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-label={t("buyFileTitle")}
+      data-testid="buy-file-dialog"
+      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      <div className="w-full max-w-[420px] rounded-t-3xl bg-[var(--surface-panel,#fff)] p-5 shadow-2xl sm:rounded-3xl">
+        <div className="mb-3 flex items-start justify-between gap-3">
+          <h2 className="flex items-center gap-2 text-[17px] font-semibold text-[var(--text-primary)]">
+            <FileDown size={18} className="text-[var(--accent-strong)]" />
+            {t("buyFileTitle")}
+          </h2>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label={t("buyFileClose")}
+            className="rounded-lg p-1 text-[var(--text-secondary)] hover:bg-black/5"
+          >
+            <X size={20} />
+          </button>
+        </div>
+
+        {access?.paid ? (
+          <p className="text-[14px] leading-relaxed text-[var(--text-primary)]" data-testid="buy-file-already">
+            {t("buyFileAlready")}
+          </p>
+        ) : (
+          <>
+            <p className="text-[13.5px] leading-relaxed text-[var(--text-secondary)]">{t("buyFileBody")}</p>
+            <label className="mt-4 block">
+              <span className="mb-1 block text-[12px] font-semibold text-[var(--text-primary)]">
+                {t("buyFileEmailLabel")}
+              </span>
+              <input
+                type="email"
+                inputMode="email"
+                autoComplete="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="name@example.com"
+                data-testid="buy-file-email"
+                className="w-full rounded-xl border border-[var(--surface-border)] bg-white px-3 py-2.5 text-[14px] text-[var(--text-primary)] outline-none focus:border-[var(--accent-strong)]"
+              />
+            </label>
+            {error && (
+              <p className="mt-2 text-[12.5px] font-semibold text-[#a4342c]" data-testid="buy-file-error">{error}</p>
+            )}
+            <button
+              type="button"
+              onClick={buy}
+              disabled={busy}
+              data-testid="buy-file-pay"
+              className="mt-4 inline-flex h-12 w-full items-center justify-center gap-2 rounded-full bg-[var(--accent-strong)] px-4 text-[14.5px] font-bold text-white transition hover:opacity-90 disabled:opacity-60"
+            >
+              {busy && <Loader2 size={16} className="animate-spin" />}
+              {t("buyFilePay", { price: priceLabel })}
+            </button>
+            {approxEur != null && (
+              <p className="mt-1.5 text-center text-[12px] font-medium text-[var(--text-secondary)]" data-testid="buy-file-approx">
+                {t("buyFileApprox", { eur: approxEur.toFixed(approxEur < 10 ? 1 : 0) })}
+              </p>
+            )}
+            <p className="mt-2 text-center text-[11.5px] leading-snug text-[var(--text-secondary)]">
+              {t("buyFileNote")}
+            </p>
+            {/* 07.10.2026: м'який апсел Pro — для тих, хто друкує на продаж (поштучний
+                файл = особисте використання) або часто. Поріг — з якого файлу Pro дешевший. */}
+            <div className="mt-4 rounded-2xl border border-[var(--surface-border)] bg-black/[0.02] px-3.5 py-3 text-[12.5px] leading-snug text-[var(--text-secondary)]" data-testid="buy-file-pro">
+              <span className="inline-flex items-start gap-1.5">
+                <ShieldCheck size={14} className="mt-0.5 shrink-0 text-[var(--accent-strong)]" />
+                <span>
+                  {t("buyFileProUpsell", { n: price > 0 ? Math.floor(SUB_PRICE.UAH / price) : 14 })}{" "}
+                  <Link
+                    href="/pro"
+                    onClick={() => { import("@/lib/analytics").then((m) => m.track("pro_cta", { place: "buy_file" })).catch(() => {}); onClose(); }}
+                    className="font-semibold text-[var(--accent-strong)] underline-offset-2 hover:underline"
+                  >
+                    {t("buyFileProLink")}
+                  </Link>
+                </span>
+              </span>
+            </div>
+          </>
+        )}
+
+        {/* Форма LiqPay: додається в DOM і одразу надсилається ефектом вище. */}
+        {pay && (
+          <form ref={formRef} method="POST" action={pay.action_url} acceptCharset="utf-8" className="hidden">
+            <input type="hidden" name="data" value={pay.data} />
+            <input type="hidden" name="signature" value={pay.signature} />
+          </form>
+        )}
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
+export default BuyFileDialog;

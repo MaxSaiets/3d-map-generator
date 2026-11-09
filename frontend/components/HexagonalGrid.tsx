@@ -1,0 +1,656 @@
+"use client";
+
+import { useState, useEffect, useRef, useMemo } from "react";
+import { useTranslations } from "next-intl";
+import { MapContainer, TileLayer, GeoJSON, useMap, ZoomControl } from "react-leaflet";
+import L from "leaflet";
+import "leaflet/dist/leaflet.css";
+import "leaflet-draw";
+
+type GBounds = { north: number; south: number; east: number; west: number };
+
+/** Компактна стартова зона сітки (~3км) довкола центру bbox міста — щоб дефолтна
+ *  сітка мала ~100 видимих клітин, а не тисячі на весь bbox міста. */
+function defaultGridArea(b: GBounds, halfKm = 1.5): GBounds {
+  const cLat = (b.north + b.south) / 2;
+  const cLon = (b.east + b.west) / 2;
+  const dLat = (halfKm * 1000) / 111_320;
+  const dLon = (halfKm * 1000) / (111_320 * Math.max(Math.cos((cLat * Math.PI) / 180), 0.2));
+  return { north: cLat + dLat, south: cLat - dLat, east: cLon + dLon, west: cLon - dLon };
+}
+
+/** Обертає всі полігони сітки на `deg`° довкола географічного центру `center`
+ *  ([lon,lat]) у МЕТРИЧНОМУ кадрі (екві-прямокутна корекція cos(lat) — точно на
+ *  масштабі міста). Повертає НОВИЙ GeoJSON; вихідний не мутується. Бек ріже кожну
+ *  плитку саме по цих (повернутих) координатах, тож превʼю=друк. */
+function rotateGridGeoJSON(geojson: any, deg: number, center: [number, number]): any {
+  if (!geojson || !geojson.features || !deg) return geojson;
+  const rad = (deg * Math.PI) / 180;
+  const cos = Math.cos(rad);
+  const sin = Math.sin(rad);
+  const [clon, clat] = center;
+  const mPerDegLat = 111_320;
+  const mPerDegLon = 111_320 * Math.max(Math.cos((clat * Math.PI) / 180), 0.2);
+  const rot = (pt: number[]): number[] => {
+    const x = (pt[0] - clon) * mPerDegLon;
+    const y = (pt[1] - clat) * mPerDegLat;
+    const xr = x * cos - y * sin;
+    const yr = x * sin + y * cos;
+    return [clon + xr / mPerDegLon, clat + yr / mPerDegLat];
+  };
+  return {
+    ...geojson,
+    features: geojson.features.map((f: any) => ({
+      ...f,
+      geometry: f?.geometry?.coordinates
+        ? { ...f.geometry, coordinates: f.geometry.coordinates.map((ring: number[][]) => ring.map(rot)) }
+        : f.geometry,
+    })),
+  };
+}
+
+/** Географічний центр (bbox) усіх клітин сітки — вісь повороту. */
+function gridCenterOf(geojson: any): [number, number] | null {
+  if (!geojson || !geojson.features || geojson.features.length === 0) return null;
+  let minLon = Infinity, maxLon = -Infinity, minLat = Infinity, maxLat = -Infinity;
+  for (const f of geojson.features) {
+    for (const ring of f?.geometry?.coordinates || []) {
+      for (const [lon, lat] of ring) {
+        if (lon < minLon) minLon = lon;
+        if (lon > maxLon) maxLon = lon;
+        if (lat < minLat) minLat = lat;
+        if (lat > maxLat) maxLat = lat;
+      }
+    }
+  }
+  if (!isFinite(minLon) || !isFinite(minLat)) return null;
+  return [(minLon + maxLon) / 2, (minLat + maxLat) / 2];
+}
+
+// Lets the user draw a rectangle to choose the AREA the grid fills (instead of
+// the whole city). On draw it reports the rectangle's bounds upward.
+function GridAreaDraw({ onArea }: { onArea: (b: GBounds) => void }) {
+  const map = useMap();
+  useEffect(() => {
+    if (!map) return;
+    const group = new L.FeatureGroup();
+    map.addLayer(group);
+    const control = new (L as any).Control.Draw({
+      // Малюнок-зона — у нижньому ПРАВОМУ куті: верхні кути звільнено під плаваючі
+      // картки (зліва — тулбар сітки, справа — керування /create).
+      position: "bottomright",
+      draw: { rectangle: { shapeOptions: { color: "#0f766e", weight: 2 } },
+        polygon: false, circle: false, marker: false, circlemarker: false, polyline: false },
+      edit: { featureGroup: group, remove: true },
+    });
+    map.addControl(control);
+    const onCreated = (e: any) => {
+      group.clearLayers();
+      group.addLayer(e.layer);
+      const b = e.layer.getBounds();
+      onArea({ north: b.getNorth(), south: b.getSouth(), east: b.getEast(), west: b.getWest() });
+    };
+    map.on((L as any).Draw.Event.CREATED, onCreated);
+    return () => {
+      map.off((L as any).Draw.Event.CREATED, onCreated);
+      try { map.removeControl(control); map.removeLayer(group); } catch { /* no-op */ }
+    };
+  }, [map, onArea]);
+  return null;
+}
+
+// Компонент для автоматичного fitBounds (тільки при першому завантаженні)
+function MapBounds({ bounds }: { bounds: { north: number; south: number; east: number; west: number } }) {
+  const map = useMap();
+  const hasFittedRef = useRef(false);
+
+  useEffect(() => {
+    if (bounds && map && !hasFittedRef.current) {
+      try {
+        map.fitBounds([
+          [bounds.south, bounds.west],
+          [bounds.north, bounds.east],
+        ] as L.LatLngBoundsExpression, {
+          padding: [20, 20],
+          maxZoom: 15,
+        });
+        hasFittedRef.current = true; // Виконуємо тільки один раз
+      } catch (e) {
+        console.error("Помилка fitBounds:", e);
+      }
+    }
+  }, [map, bounds]);
+  return null;
+}
+
+interface HexagonalGridProps {
+  bounds: {
+    north: number;
+    south: number;
+    east: number;
+    west: number;
+  };
+  onZonesSelected: (zones: any[]) => void;
+  gridType?: "hexagonal" | "square" | "circle";
+  hexSizeM?: number;
+  /** Поворот сітки (°): обертає клітини довкола центру сітки. Чисто на клієнті —
+   *  бек ріже кожну плитку по її (вже повернутому) полігону (zone_polygon_coords). */
+  rotationDeg?: number;
+  /** Notifies the parent when the user draws/clears the grid area (large zone). */
+  onAreaChange?: (area: GBounds | null) => void;
+  /** Pre-set the grid area (e.g. when reopening a saved grid from history). */
+  initialArea?: GBounds | null;
+  /** Клітини, вже куплені у попередньому замовленні (id `hex_2_3` тощо) — їх
+   *  підсвічуємо золотим «куплено» і НЕ даємо обирати знову (продовження панно). */
+  boughtCells?: Set<string>;
+}
+
+// Стилі для шестикутників
+const defaultStyle = {
+  color: "#3388ff",
+  weight: 1.5,
+  opacity: 0.8,
+  fillOpacity: 0.15,
+};
+
+const selectedStyle = {
+  color: "#dc2626",
+  weight: 3,
+  opacity: 1,
+  fillOpacity: 0.6,
+  fillColor: "#ef4444",
+};
+
+const hoverStyle = {
+  color: "#10b981",
+  weight: 2.5,
+  opacity: 1,
+  fillOpacity: 0.3,
+  fillColor: "#34d399",
+};
+
+// Вже куплена клітина (продовження панно) — золота, не обирається повторно.
+const boughtStyle = {
+  color: "#b45309",
+  weight: 2.5,
+  opacity: 1,
+  fillOpacity: 0.55,
+  fillColor: "#f59e0b",
+};
+
+export default function HexagonalGrid({
+  bounds,
+  onZonesSelected,
+  gridType: externalGridType = "hexagonal",
+  hexSizeM: externalHexSizeM = 450.0,
+  rotationDeg = 0,
+  onAreaChange,
+  initialArea = null,
+  boughtCells,
+}: HexagonalGridProps) {
+  const t = useTranslations("grid");
+  const normalizeId = (id: any): string => String(id ?? "");
+  const boughtCellsRef = useRef<Set<string>>(new Set());
+  boughtCellsRef.current = boughtCells ?? new Set();
+  const [hexGrid, setHexGrid] = useState<any>(null);
+  // Вісь повороту = географічний центр сітки (стабільний поки сітка та сама).
+  const gridCenter = useMemo(() => gridCenterOf(hexGrid), [hexGrid]);
+  // Повернена сітка — те, що РЕАЛЬНО показуємо й шлемо на генерацію (клік/select/crop
+  // усі бачать уже повернуті полігони). rotationDeg=0 → той самий обʼєкт (no-op).
+  const displayGrid = useMemo(
+    () => (rotationDeg && gridCenter ? rotateGridGeoJSON(hexGrid, rotationDeg, gridCenter) : hexGrid),
+    [hexGrid, rotationDeg, gridCenter],
+  );
+  const [selectedZones, setSelectedZones] = useState<Set<string>>(new Set());
+  // Ordered selection (so zones can be generated and previewed "one after another")
+  const [selectedOrder, setSelectedOrder] = useState<string[]>([]);
+  const [hoveredZone, setHoveredZone] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  // Інлайн-помилка генерації сітки (замість блокуючого alert()).
+  const [gridError, setGridError] = useState<string | null>(null);
+  // User-drawn area (large zone) the grid fills. Falls back to the city bounds.
+  const [drawnBounds, setDrawnBounds] = useState<GBounds | null>(null);
+  const drawnBoundsRef = useRef<GBounds | null>(null);
+  const [isValid, setIsValid] = useState(true);
+  const [validationErrors, setValidationErrors] = useState<string[]>([]);
+
+  // IMPORTANT: Leaflet feature handlers are attached once and keep stale React closures.
+  // Use refs as the source of truth for click/hover handlers.
+  const hexGridRef = useRef<any>(null);
+  const selectedZonesRef = useRef<Set<string>>(new Set());
+  const selectedOrderRef = useRef<string[]>([]);
+  const hoveredZoneRef = useRef<string | null>(null);
+  const onZonesSelectedRef = useRef(onZonesSelected);
+
+  useEffect(() => {
+    // Ref тримає ПОВЕРНУТУ сітку — щоб клік-хендлери (стейл-замикання Leaflet)
+    // повертали клікнуті/обрані фічі з уже повернутими координатами.
+    hexGridRef.current = displayGrid;
+  }, [displayGrid]);
+  useEffect(() => {
+    selectedZonesRef.current = new Set(selectedZones);
+  }, [selectedZones]);
+  useEffect(() => {
+    selectedOrderRef.current = [...selectedOrder];
+  }, [selectedOrder]);
+  useEffect(() => {
+    hoveredZoneRef.current = hoveredZone;
+  }, [hoveredZone]);
+  useEffect(() => {
+    onZonesSelectedRef.current = onZonesSelected;
+  }, [onZonesSelected]);
+
+  // Використовуємо зовнішні значення якщо передані, інакше внутрішні
+  const [internalGridType, setInternalGridType] = useState<"hexagonal" | "square" | "circle">("hexagonal");
+  // "Applied" params — те, що реально використовувалось при генерації
+  const [appliedGridType, setAppliedGridType] = useState(externalGridType || "hexagonal");
+  const [appliedHexSizeM, setAppliedHexSizeM] = useState(externalHexSizeM || 450.0);
+
+  const gridType = externalGridType || internalGridType;
+  const hexSizeM = externalHexSizeM || 450.0;
+
+  // Чи є незастосовані зміни параметрів
+  const hasPendingChanges = gridType !== appliedGridType || hexSizeM !== appliedHexSizeM;
+
+  const generateGrid = async () => {
+    if (isLoading) return; // Запобігаємо подвійній генерації
+
+    // Запам'ятовуємо параметри які застосовуємо
+    setAppliedGridType(gridType);
+    setAppliedHexSizeM(hexSizeM);
+
+    setIsLoading(true);
+    setGridError(null);
+    setHexGrid(null); // Скидаємо попередню сітку
+
+    try {
+
+      const { api } = await import("@/lib/api");
+
+      // Use the user-drawn area when present. Раніше fallback = ВЕСЬ bbox міста
+      // (~44км) → тисячі клітин (8807 для Києва), що зливались у суцільну пляму
+      // і користувач не розумів, що це окремі клітини. Тепер дефолт — компактна
+      // зона ~3км довкола центру міста: ~100 видимих клітин, які легко обирати.
+      // Юзер може намалювати власну зону прямокутником.
+      const eb = drawnBoundsRef.current || defaultGridArea(bounds);
+      if (!eb || eb.north <= eb.south || eb.east <= eb.west) {
+        throw new Error(`Невірні координати bounds: north=${eb?.north}, south=${eb?.south}, east=${eb?.east}, west=${eb?.west}`);
+      }
+
+
+      const data = await api.generateHexagonalGrid({
+        north: eb.north,
+        south: eb.south,
+        east: eb.east,
+        west: eb.west,
+        hex_size_m: hexSizeM,
+        grid_type: gridType,
+      });
+
+
+
+      if (!data.geojson || !data.geojson.features || data.geojson.features.length === 0) {
+        throw new Error(t("errorEmptyGrid"));
+      }
+
+      // Діагностика першого feature
+      if (data.geojson.features.length > 0) {
+        const firstFeature = data.geojson.features[0];
+        const firstCoords = firstFeature?.geometry?.coordinates?.[0]?.[0];
+        // Debug only in dev: console.log("[HexagonalGrid] first hex:", firstFeature?.id);
+      }
+
+      setHexGrid(data.geojson);
+      setIsValid(data.is_valid);
+      setValidationErrors(data.validation_errors || []);
+    } catch (error: any) {
+      console.error("Помилка генерації сітки:", error);
+      const errorMessage = error.response?.data?.detail || error.message || String(error);
+      setGridError(t("errorGenerate", { error: errorMessage }));
+      setHexGrid(null);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleZoneClick = (zoneIdRaw: any) => {
+    const zoneId = normalizeId(zoneIdRaw);
+    const currentSelected = selectedZonesRef.current;
+    const currentOrder = selectedOrderRef.current;
+
+    if (!zoneId) {
+      console.error("[HexagonalGrid] zoneId is empty!");
+      return;
+    }
+    // Куплені клітини не обираються повторно (продовження = лише НОВІ сусідні).
+    if (boughtCellsRef.current.has(zoneId)) {
+      return;
+    }
+
+    const nextSelected = new Set(currentSelected);
+    let nextOrder = [...currentOrder];
+
+    // Перемикаємо стан зони
+    if (nextSelected.has(zoneId)) {
+      nextSelected.delete(zoneId);
+      nextOrder = nextOrder.filter((id) => id !== zoneId);
+
+    } else {
+      nextSelected.add(zoneId);
+      // Add to the end to preserve click order
+      if (!nextOrder.includes(zoneId)) nextOrder.push(zoneId);
+
+    }
+    // Sync refs immediately (so next click sees updated state even before React renders)
+    selectedZonesRef.current = nextSelected;
+    selectedOrderRef.current = nextOrder;
+    setSelectedZones(nextSelected);
+    setSelectedOrder(nextOrder);
+
+    // Оновлюємо список вибраних зон у стабільному порядку (click-order),
+    // щоб backend створював задачі у тій же послідовності.
+    const featureById = new Map<string, any>();
+    for (const f of (hexGridRef.current?.features || [])) {
+      const fId = normalizeId(f.id || f.properties?.id);
+      if (fId) featureById.set(fId, f);
+    }
+    const selectedFeatures = nextOrder.map((id) => featureById.get(id)).filter(Boolean);
+
+
+    onZonesSelectedRef.current(selectedFeatures);
+  };
+
+  const handleSelectAll = () => {
+    if (!displayGrid || !displayGrid.features) return;
+    const all = (displayGrid.features || [])
+      .map((f: any) => ({ id: normalizeId(f.id || f.properties?.id), feature: f }))
+      .filter((x: any) => !!x.id);
+    // Default order: by row/col if present (better UX for "in a row" selections), else original order
+    all.sort((a: any, b: any) => {
+      const ar = a.feature?.properties?.row;
+      const br = b.feature?.properties?.row;
+      const ac = a.feature?.properties?.col;
+      const bc = b.feature?.properties?.col;
+      if (ar != null && br != null && ar !== br) return ar - br;
+      if (ac != null && bc != null && ac !== bc) return ac - bc;
+      return String(a.id).localeCompare(String(b.id));
+    });
+    const allZoneIds = new Set<string>(all.map((x: any) => x.id as string));
+    selectedZonesRef.current = allZoneIds;
+    selectedOrderRef.current = all.map((x: any) => x.id);
+    setSelectedZones(allZoneIds);
+    setSelectedOrder(all.map((x: any) => x.id));
+    onZonesSelectedRef.current(all.map((x: any) => x.feature));
+
+  };
+
+  const handleDeselectAll = () => {
+    selectedZonesRef.current = new Set();
+    selectedOrderRef.current = [];
+    setSelectedZones(new Set());
+    setSelectedOrder([]);
+    onZonesSelectedRef.current([]);
+
+  };
+
+  const handleZoneHover = (zoneId: string | null) => {
+    hoveredZoneRef.current = zoneId;
+    setHoveredZone(zoneId);
+  };
+
+  const getZoneStyle = (zoneId: string) => {
+    const zid = normalizeId(zoneId);
+    if (!zid) {
+      console.warn("[HexagonalGrid] getZoneStyle called with empty zoneId");
+      return defaultStyle;
+    }
+
+    // Куплена клітина має пріоритет — золота, не реагує на вибір/наведення.
+    if (boughtCellsRef.current.has(zid)) {
+      return boughtStyle;
+    }
+    const isSelected = selectedZonesRef.current.has(zid);
+    const isHovered = hoveredZoneRef.current === zid;
+
+    if (isSelected) {
+      return selectedStyle;
+    }
+    if (isHovered) {
+      return hoverStyle;
+    }
+    return defaultStyle;
+  };
+
+  const center: [number, number] = [
+    (bounds.north + bounds.south) / 2,
+    (bounds.east + bounds.west) / 2,
+  ];
+
+  // Автоматично генеруємо сітку при першому відкритті або зміні bounds (міста)
+  // НЕ перегенеруємо при зміні gridType/hexSizeM — для цього є кнопка "Застосувати"
+  useEffect(() => {
+    if (!bounds) return;
+    if (bounds.north <= bounds.south || bounds.east <= bounds.west) return;
+    if (!hexGrid && !isLoading) {
+      const timer = setTimeout(() => { generateGrid(); }, 200);
+      return () => clearTimeout(timer);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bounds?.north, bounds?.south, bounds?.east, bounds?.west]);
+
+  const handleAreaDraw = (b: GBounds) => {
+    drawnBoundsRef.current = b;
+    setDrawnBounds(b);
+    onAreaChange?.(b);
+    setSelectedZones(new Set());
+    setSelectedOrder([]);
+    setHexGrid(null);
+    // regenerate the grid inside the drawn area
+    setTimeout(() => generateGrid(), 50);
+  };
+
+  const resetArea = () => {
+    drawnBoundsRef.current = null;
+    setDrawnBounds(null);
+    onAreaChange?.(null);
+    setHexGrid(null);
+    setTimeout(() => generateGrid(), 50);
+  };
+
+  // Apply a pre-set area (reopening a saved grid from history) once on mount.
+  const appliedInitialAreaRef = useRef(false);
+  useEffect(() => {
+    if (appliedInitialAreaRef.current || !initialArea) return;
+    appliedInitialAreaRef.current = true;
+    drawnBoundsRef.current = initialArea;
+    setDrawnBounds(initialArea);
+    setHexGrid(null);
+    setTimeout(() => generateGrid(), 80);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialArea]);
+
+  const zoom = 11; // Оптимальний zoom для Києва
+
+  return (
+    // РЕДИЗАЙН: leaflet ЗАПОВНЮЄ весь блок (absolute inset-0), а тулбар сітки —
+    // компактна плаваюча картка у ЛІВОМУ ВЕРХНЬОМУ куті НА мапі (правий верх
+    // зайнятий оверлеєм /create; zoom внизу-зліва; малюнок-зона внизу-справа).
+    <div className="w-full h-full relative">
+      <div className="absolute inset-0">
+        <MapContainer
+          center={center}
+          zoom={zoom}
+          style={{ height: "100%", width: "100%" }}
+          scrollWheelZoom={true}
+          zoomControl={false}
+          whenReady={() => {
+            // Карта готова
+          }}
+        >
+          {/* Зум — у нижній лівий кут (верхні кути під плаваючі картки). */}
+          <ZoomControl position="bottomleft" />
+          <TileLayer
+            url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+          />
+          {/* Фітимо карту на ДЕФОЛТНУ зону сітки (~3км), а не весь bbox міста —
+              інакше компактна сітка виглядала б крихітною плямою в центрі. */}
+          <MapBounds bounds={drawnBounds || initialArea || defaultGridArea(bounds)} />
+          <GridAreaDraw onArea={handleAreaDraw} />
+
+          {displayGrid && displayGrid.features && displayGrid.features.length > 0 && (
+            <GeoJSON
+              // IMPORTANT: Do NOT remount on selection changes, otherwise the map/tiles can "jump back".
+              // rotationDeg у ключі → шар перемальовується ПОВЕРНУТИМ при зміні кута.
+              key={`hex-grid-${displayGrid.features.length}-${gridType}-${hexSizeM}-${Math.round(rotationDeg)}`}
+              data={displayGrid}
+              style={(feature) => {
+                const zoneId = normalizeId(feature?.properties?.id || feature?.id);
+                if (!zoneId) {
+                  console.warn("[HexagonalGrid] Feature without ID in style function:", feature);
+                  return defaultStyle;
+                }
+                const style = getZoneStyle(zoneId);
+                return style;
+              }}
+              onEachFeature={(feature, layer) => {
+                const zoneId = normalizeId(feature?.properties?.id || feature?.id);
+
+                if (!zoneId) {
+                  console.error("[HexagonalGrid] Feature without ID:", feature);
+                  return;
+                }
+
+
+
+                // Зберігаємо посилання на layer для оновлення стилю
+                (layer as any)._hexZoneId = zoneId;
+
+                layer.on({
+                  click: (e: L.LeafletMouseEvent) => {
+                    e.originalEvent?.stopPropagation?.();
+                    e.originalEvent?.preventDefault?.();
+
+                    // Apply immediate visual feedback based on ref state (no stale closures)
+                    const willSelect = !selectedZonesRef.current.has(zoneId);
+                    handleZoneClick(zoneId);
+
+                    // Оновлюємо стиль після кліку
+                    setTimeout(() => {
+                      // Use immediate decision first, then fallback to state-driven style
+                      (layer as L.Path).setStyle(willSelect ? selectedStyle : defaultStyle);
+                      // After state settles, sync with computed style
+                      setTimeout(() => (layer as L.Path).setStyle(getZoneStyle(zoneId)), 0);
+                    }, 0);
+                  },
+                  mouseover: () => {
+                    handleZoneHover(zoneId);
+                    (layer as L.Path).setStyle(hoverStyle);
+                  },
+                  mouseout: () => {
+                    handleZoneHover(null);
+                    (layer as L.Path).setStyle(getZoneStyle(zoneId));
+                  },
+                });
+
+                // Додаємо popup з інформацією (тільки при наведенні, не при кліку)
+                const props = feature.properties || {};
+                const isSelected = selectedZones.has(zoneId);
+                layer.bindTooltip(
+                  `<b>${t("tooltipZone", { zone: zoneId })}</b><br/>${t("tooltipRowCol", { row: props.row, col: props.col })}<br/>${isSelected ? '<span style="color: red; font-weight: bold;">' + t("tooltipSelected") + '</span>' : '<span style="color: gray;">' + t("tooltipClickToSelect") + '</span>'}`,
+                  {
+                    permanent: false,
+                    direction: 'top',
+                    offset: [0, -10],
+                    className: 'zone-tooltip'
+                  }
+                );
+              }}
+            />
+          )}
+        </MapContainer>
+      </div>
+
+      {/* ПЛАВАЮЧИЙ ТУЛБАР СІТКИ (лівий верх НА мапі): лічильники + дії компактно.
+          z-[500] — над leaflet-панелями; pointer-events-none на контейнері, а
+          сама картка events-auto, щоб кліки по мапі поза карткою проходили. */}
+      <div className="pointer-events-none absolute left-2 top-2 z-[500] w-[172px] max-w-[calc(58%-0.5rem)] space-y-1 rounded-[14px] border border-gray-200 bg-white/95 px-2 py-1.5 shadow-[0_8px_24px_rgba(15,23,42,0.12)] backdrop-blur lg:w-[200px] lg:max-w-[calc(100%-1rem)]">
+        {gridError && (
+          <div className="pointer-events-auto flex items-center justify-between gap-2 rounded-md border border-red-200 bg-red-50 px-2 py-0.5 text-[10px] text-red-700">
+            <span>⚠ {gridError}</span>
+            <button type="button" onClick={() => setGridError(null)} className="font-semibold underline-offset-2 hover:underline">{t("hide")}</button>
+          </div>
+        )}
+        {isLoading ? (
+          <div className="pointer-events-auto flex items-center gap-1.5 text-[10px]">
+            <div className="animate-spin rounded-full h-3 w-3 border-b-2 border-blue-500"></div>
+            <span className="text-gray-700">{t("generating")}</span>
+          </div>
+        ) : hexGrid ? (
+          <div className="pointer-events-auto space-y-1">
+            {/* Лічильники (форму-легенду крапок прибрано — економимо місце). */}
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] leading-4 text-gray-600">
+              <span className="font-medium text-gray-700">
+                {t("cellsLabel")} <span className="text-gray-900 font-semibold">{hexGrid.features.length}</span>
+              </span>
+              <span className="text-gray-400">·</span>
+              <span className="font-medium text-blue-700">
+                {t("selectedLabel")} <span className="text-blue-800 font-bold">{selectedZones.size}</span>
+              </span>
+              {selectedZones.size > 0 && (
+                <span className="text-green-700 font-semibold">✓ {t("ready")}</span>
+              )}
+              {!isValid && validationErrors.length > 0 && (
+                <span className="text-red-600">
+                  ⚠ {t("validationErrors", { n: validationErrors.length })}
+                </span>
+              )}
+            </div>
+            {/* Дії компактним рядом. */}
+            <div className="flex flex-wrap items-center gap-1">
+              {hasPendingChanges && (
+                <button
+                  onClick={generateGrid}
+                  className="inline-flex min-h-[36px] items-center px-2.5 py-1.5 text-[11px] bg-orange-500 text-white rounded hover:bg-orange-600 transition-colors font-semibold"
+                  title={t("applyTitle", { type: gridType, size: hexSizeM })}
+                >
+                  ↻ {t("apply")}
+                </button>
+              )}
+              <button
+                onClick={handleSelectAll}
+                className="inline-flex min-h-[36px] items-center px-2.5 py-1.5 text-[11px] bg-blue-500 text-white rounded hover:bg-blue-600 transition-colors"
+                title={t("selectAllTitle")}
+              >
+                {t("all")}
+              </button>
+              <button
+                onClick={handleDeselectAll}
+                className="inline-flex min-h-[36px] items-center px-2.5 py-1.5 text-[11px] bg-gray-500 text-white rounded hover:bg-gray-600 transition-colors"
+                title={t("clearTitle")}
+              >
+                {t("clear")}
+              </button>
+              {drawnBounds ? (
+                <button
+                  onClick={resetArea}
+                  className="inline-flex min-h-[36px] items-center px-2.5 py-1.5 text-[11px] bg-teal-600 text-white rounded hover:bg-teal-700 transition-colors"
+                  title={t("resetAreaTitle")}
+                >
+                  ⤢ {t("ownZone")}
+                </button>
+              ) : (
+                <span className="inline-flex min-h-[36px] items-center px-2.5 py-1.5 text-[11px] text-teal-700" title={t("drawZoneTitle")}>
+                  ▢ {t("drawZone")}
+                </span>
+              )}
+            </div>
+          </div>
+        ) : (
+          <div className="pointer-events-auto text-[10px] text-gray-600">{t("generating")}</div>
+        )}
+      </div>
+    </div>
+  );
+}
+

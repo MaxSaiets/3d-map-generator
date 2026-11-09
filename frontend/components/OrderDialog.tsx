@@ -1,0 +1,520 @@
+"use client";
+
+import { useState, useEffect, useRef } from "react";
+import { createPortal } from "react-dom";
+import { X, Loader2, CheckCircle2, Truck, Package, ShieldCheck, Lock, PhoneCall, Wallet } from "lucide-react";
+import { useTranslations } from "next-intl";
+import { capturePreviewImages } from "@/lib/capturePreview";
+import { useAuth } from "@/components/AuthProvider";
+import { NovaPoshtaPicker } from "@/components/NovaPoshtaPicker";
+import { KEYCHAIN_PRICE_UAH, MAP_SIZE_PRICES_UAH } from "@/lib/mapPrices";
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
+
+// Рішення власника 2026-09-02: замовлення ЛИШЕ по Україні. Регіон «ЄС», Nova Post (EU)
+// та Meest прибрано з форми повністю (повернення ЄС — окрема задача з прайсом ×10,
+// див. plans/02 T-B.3). Завантаження файлу для самодруку лишається доступним усім.
+type Delivery = "nova" | "ukr" | "pickup";
+
+export interface OrderSummary {
+  city?: string;
+  district?: string;
+  label?: string;   // keychain text
+  size?: string;
+}
+
+/**
+ * Customer order form. Captures screenshots of the live 3D preview and posts
+ * the order to the backend, which forwards everything to the Telegram CRM.
+ */
+export function OrderDialog({
+  open,
+  onClose,
+  taskId,
+  productType,
+  summary,
+  priceText,
+  modelPending = false,
+}: {
+  open: boolean;
+  onClose: () => void;
+  taskId: string | null;
+  productType: "map" | "keychain" | "floorplan";
+  summary: OrderSummary;
+  /** Жива орієнтовна ціна з /api/quote; без неї — статичний i18n-fallback. */
+  priceText?: string;
+  /** Модель ще генерується (order-now) — показуємо заспокійливу примітку. */
+  modelPending?: boolean;
+}) {
+  const t = useTranslations("order");
+
+  // Три продукти × три місця виводу ціни/назви — тернарники розповзались і вже
+  // давали різні підписи в різних кутках форми. Один хелпер на кожне.
+  const productLabel = productType === "keychain" ? t("prodKeychain")
+    : productType === "floorplan" ? t("prodFloorplan") : t("prodMap");
+  const fallbackPrice = productType === "keychain" ? t("estPriceKeychain")
+    : productType === "floorplan" ? t("estPriceFloorplan") : t("estPriceMap");
+  const [name, setName] = useState("");
+  const [phone, setPhone] = useState("");
+  const [email, setEmail] = useState("");
+  const [delivery, setDelivery] = useState<Delivery>("nova");
+  const [copied, setCopied] = useState(false);
+  const [city, setCity] = useState("");
+  const [branch, setBranch] = useState("");
+  const [address, setAddress] = useState("");
+  const [comment, setComment] = useState("");
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // Яке поле спричинило помилку валідації → aria-invalid + aria-describedby на ньому
+  // (озвучення для незрячих, куди саме дивитись). null = немає / серверна помилка.
+  const [errorField, setErrorField] = useState<string | null>(null);
+  const [orderNumber, setOrderNumber] = useState<string | null>(null);
+  // payment: { provider?: "liqpay", action_url?, data?, signature?, url?, label? }
+  const [payment, setPayment] = useState<any>(null);
+  const { getIdToken, user, signIn } = useAuth();
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const firstInputRef = useRef<HTMLInputElement | null>(null);
+  const previouslyFocusedRef = useRef<HTMLElement | null>(null);
+
+  // Скидаємо екран успіху при КОЖНОМУ відкритті — інакше після одного замовлення
+  // повторне відкриття (інша модель) показувало СТАРИЙ «#123 прийнято» замість форми,
+  // і друге замовлення неможливо було оформити без перезавантаження. (контакт лишаємо.)
+  useEffect(() => {
+    if (open) {
+      setOrderNumber(null); setPayment(null); setError(null); setErrorField(null); setSending(false);
+      // Воронка: користувач відкрив форму замовлення (передостанній крок).
+      import("@/lib/analytics").then((m) => m.trackFunnel("order_open")).catch(() => {});
+    }
+  }, [open]);
+
+  // Escape closes the dialog; only active while open.
+  useEffect(() => {
+    if (!open) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [open, onClose]);
+
+  // Focus management: move focus into the dialog on open, restore on close (best-effort).
+  useEffect(() => {
+    if (!open) return;
+    previouslyFocusedRef.current = (document.activeElement as HTMLElement) || null;
+    // Defer so the portal content is mounted before focusing.
+    const id = window.setTimeout(() => {
+      if (firstInputRef.current) firstInputRef.current.focus();
+      else if (containerRef.current) containerRef.current.focus();
+    }, 0);
+    return () => {
+      window.clearTimeout(id);
+      const prev = previouslyFocusedRef.current;
+      if (prev && typeof prev.focus === "function") {
+        try { prev.focus(); } catch { /* ignore */ }
+      }
+    };
+  }, [open]);
+
+  // Focus trap: keep Tab focus within the dialog, wrapping at the edges.
+  const handleTrapKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.key !== "Tab") return;
+    const container = containerRef.current;
+    if (!container) return;
+    const focusable = Array.from(
+      container.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      )
+    ).filter((el) => el.offsetParent !== null || el === document.activeElement);
+    if (focusable.length === 0) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    const active = document.activeElement as HTMLElement | null;
+    if (e.shiftKey) {
+      if (active === first || !container.contains(active)) {
+        e.preventDefault();
+        last.focus();
+      }
+    } else {
+      if (active === last || !container.contains(active)) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+  };
+
+  if (!open) return null;
+
+  // aria-invalid + aria-describedby лише на полі, що спричинило поточну помилку
+  // (не на всіх — інакше describedby звучав би для кожного інпута).
+  const errAttrs = (field: string) =>
+    errorField === field ? ({ "aria-invalid": true, "aria-describedby": "order-error" } as const) : {};
+
+  // T-2.2: валідація «на ходу» (onBlur) — помилку видно одразу біля поля, а не
+  // лише після натискання «Оформити». Правила ті самі, що в submit().
+  const fieldError = (field: string): string | null => {
+    switch (field) {
+      case "name": return name.trim() ? null : t("errName");
+      case "phone":
+        if (!phone.trim()) return t("errPhone");
+        return phone.replace(/\D/g, "").length < 10 ? t("errPhoneFormat") : null;
+      case "email":
+        return email.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()) ? t("errEmail") : null;
+      case "city": return delivery !== "pickup" && !city.trim() ? t("errCity") : null;
+      case "branch": return delivery !== "pickup" && !branch.trim() ? (delivery === "nova" ? t("errNova") : t("errUkr")) : null;
+      case "address": return delivery === "ukr" && !address.trim() ? t("errUkrAddress") : null;
+      default: return null;
+    }
+  };
+  const onBlurValidate = (field: string) => () => {
+    const msg = fieldError(field);
+    if (msg) { setErrorField(field); setError(msg); }
+    else if (errorField === field) { setErrorField(null); setError(null); }
+  };
+
+  const submit = async () => {
+    const fail = (field: string, msg: string) => {
+      setErrorField(field);
+      setError(msg);
+      // Курсор одразу в проблемне поле — інакше помилка в sticky-футері, а поле
+      // десь вище у скролі (на телефоні його взагалі не видно).
+      try {
+        const el = document.getElementById(`order-${field}`) as HTMLInputElement | null;
+        el?.focus();
+        el?.scrollIntoView({ block: "center", behavior: "smooth" });
+      } catch { /* ignore */ }
+    };
+    if (!name.trim()) { fail("name", t("errName")); return; }
+    if (!phone.trim()) { fail("phone", t("errPhone")); return; }
+    // Базова перевірка телефону: лишаємо тільки цифри, очікуємо ≥10 (UA +380 = 12).
+    if (phone.replace(/\D/g, "").length < 10) { fail("phone", t("errPhoneFormat")); return; }
+    if (email.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) { fail("email", t("errEmail")); return; }
+    if (delivery !== "pickup") {
+      if (!city.trim()) { fail("city", t("errCity")); return; }
+      if (!branch.trim()) { fail("branch", delivery === "nova" ? t("errNova") : t("errUkr")); return; }
+      // Укрпошта потребує і місто+індекс, і вулицю/будинок (інакше недоставне).
+      if (delivery === "ukr" && !address.trim()) { fail("address", t("errUkrAddress")); return; }
+    }
+    setErrorField(null);
+    setError(null);
+    setSending(true);
+    try {
+      // Захоплюємо превʼю (SVG-дизайнер брелка + 3D-canvas) — оператор у Telegram
+      // побачить ТОЧНО що замовив клієнт (текст, розташування) ще до друку.
+      const screenshots = await capturePreviewImages();
+      // Якщо клієнт залогінений — замовлення привʼяжеться до акаунта (видно в кабінеті).
+      let token: string | null = null;
+      try { token = await getIdToken(); } catch { /* ignore */ }
+      const res = await fetch(`${API_BASE}/api/order`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        body: JSON.stringify({
+          name, phone, email, product_type: productType, task_id: taskId,
+          delivery_method: delivery,
+          delivery_country: "Україна",
+          delivery_city: city,
+          delivery_branch: branch, delivery_address: address, comment,
+          est_price: priceText || fallbackPrice,
+          summary, screenshots,
+        }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setOrderNumber(String(data.order_number));
+      setPayment(data.payment || null);
+      // ⭐08.09.2026: зберігаємо чек ЛОКАЛЬНО, щоб клієнт міг доплатити пізніше.
+      // Досі форма оплати жила лише у стані цього діалогу: пішов на LiqPay, не
+      // завершив і повернувся на /order-success — там була лише «очікує оплати»
+      // без жодної кнопки. Ключ — номер замовлення; чистимо записи старші 14 днів.
+      try {
+        if (data.order_number && data.payment) {
+          const now = Date.now();
+          for (const k of Object.keys(localStorage)) {
+            if (!k.startsWith("mnd_pay_")) continue;
+            try {
+              const old = JSON.parse(localStorage.getItem(k) || "{}");
+              if (!old.ts || now - old.ts > 14 * 24 * 3600 * 1000) localStorage.removeItem(k);
+            } catch { localStorage.removeItem(k); }
+          }
+          localStorage.setItem(`mnd_pay_${data.order_number}`, JSON.stringify({ ...data.payment, ts: now }));
+        }
+      } catch { /* приватний режим — просто без збереження */ }
+      // Google Ads / GA4 conversion — головна ціль реклами (надіслане замовлення = лід).
+      try {
+        const { trackConversion, trackFunnel } = await import("@/lib/analytics");
+        trackFunnel("order_submit"); // останній крок воронки — замовлення надіслане
+        // Валюту беремо з ТОГО САМОГО рядка, що й число (priceText) — на не-uk локалях
+        // ціна показується в €, хоча доставка лише по Україні.
+        const raw = String(priceText || "");
+        let value = raw ? Number(raw.replace(/[^\d]/g, "")) || undefined : undefined;
+        let currency = raw.includes("€") ? "EUR" : "UAH";
+        // Фолбек: якщо quote ще не завантажився (priceText порожній), конверсія без
+        // value марна для Smart Bidding. Беремо мінімальну ціну продукту в ₴,
+        // щоб КОЖНА конверсія несла суму. (KEYCHAIN 120 / MAP S=350 ₴.)
+        if (value === undefined) {
+          value = productType === "keychain" ? KEYCHAIN_PRICE_UAH : MAP_SIZE_PRICES_UAH[55];
+          currency = "UAH";
+        }
+        trackConversion("order", {
+          value,
+          currency,
+          transactionId: String(data.order_number),
+          props: { product: productType, delivery },
+        });
+      } catch { /* ignore */ }
+    } catch (e: any) {
+      setError(t("sendFail"));
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const fieldCls = "w-full rounded-2xl border border-[var(--surface-border)] bg-white px-4 py-3 text-sm text-[var(--text-primary)] outline-none transition focus:border-[rgba(11,92,87,0.4)]";
+
+  // Portal to <body>: ancestors with backdrop-filter/transform become the
+  // containing block for position:fixed, clipping the dialog inside side panels.
+  const dialog = (
+    <div
+      className="fixed inset-0 z-[80] flex items-end justify-center bg-black/40 p-0 backdrop-blur-sm sm:items-center sm:p-4"
+      onClick={onClose}
+    >
+      <div
+        ref={containerRef}
+        tabIndex={-1}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="order-dialog-title"
+        className="max-h-[92dvh] w-full max-w-[460px] overflow-y-auto rounded-t-[28px] border border-[var(--surface-border)] bg-[var(--surface-panel,#fff)] p-5 shadow-[0_30px_80px_rgba(15,23,42,0.35)] sm:rounded-[28px]"
+        onClick={(e) => e.stopPropagation()}
+        onKeyDown={handleTrapKeyDown}
+      >
+        {orderNumber ? (
+          <div className="py-6 text-center">
+            <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-emerald-100 text-emerald-700">
+              <CheckCircle2 size={30} />
+            </div>
+            <h3 id="order-dialog-title" className="font-serif text-2xl text-[var(--text-primary)]">{t("acceptedTitle")}</h3>
+            <p className="mt-2 text-sm text-[var(--text-secondary)]">
+              {t("orderNo")} <b className="text-[var(--text-primary)]">#{orderNumber}</b>.<br />
+              {t("acceptedText")}
+            </p>
+            {/* T-2.4: детермінований екран успіху — «що далі» + скопіювати номер. */}
+            <button
+              type="button"
+              onClick={() => {
+                try { navigator.clipboard?.writeText(String(orderNumber)); setCopied(true); setTimeout(() => setCopied(false), 1800); } catch { /* ignore */ }
+              }}
+              className="mt-2 rounded-full border border-[var(--surface-border)] bg-white px-3 py-1 text-[12px] font-semibold text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+            >
+              {copied ? `✓ ${t("copied")}` : t("copyNo")}
+            </button>
+            <ol className="mx-auto mt-4 max-w-[320px] space-y-1.5 text-left text-[12.5px] leading-5 text-[var(--text-secondary)]">
+              {(["next1", "next2", "next3"] as const).map((k, i) => (
+                <li key={k} className="flex gap-2">
+                  <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-[rgba(46,74,58,0.1)] text-[11px] font-bold text-[var(--accent-strong)]">{i + 1}</span>
+                  <span>{t(k)}</span>
+                </li>
+              ))}
+            </ol>
+            {payment && (() => {
+              const payLabel = `${t("payNow")} · ${priceText || fallbackPrice}`;
+              const btnCls = "mt-5 inline-flex min-h-12 w-full items-center justify-center gap-2 rounded-full bg-[var(--bronze,#8E6B3D)] px-5 py-3 text-[15px] font-extrabold text-white shadow-[0_16px_34px_rgba(142,107,61,0.32)] transition hover:opacity-90";
+              if (payment.provider === "liqpay" && payment.data && payment.signature) {
+                // Форма-POST на LiqPay checkout (стандартна кнопка LiqPay), у новій вкладці.
+                return (
+                  <>
+                    <form action={payment.action_url} method="POST" acceptCharset="utf-8" target="_blank" className="mt-0">
+                      <input type="hidden" name="data" value={payment.data} />
+                      <input type="hidden" name="signature" value={payment.signature} />
+                      <button type="submit" className={btnCls}>{payLabel}</button>
+                    </form>
+                    <p className="mt-2 text-[11px] leading-4 text-[var(--text-secondary)]">{t("payLater")}</p>
+                  </>
+                );
+              }
+              if (payment.url) {
+                return (
+                  <>
+                    <a href={payment.url} target="_blank" rel="noopener noreferrer" className={btnCls}>{payLabel}</a>
+                    <p className="mt-2 text-[11px] leading-4 text-[var(--text-secondary)]">{t("payLater")}</p>
+                  </>
+                );
+              }
+              return null;
+            })()}
+            <button onClick={onClose} className="mt-5 inline-flex min-h-12 w-full items-center justify-center rounded-full bg-[var(--accent-strong)] px-5 py-3 text-sm font-semibold text-white">
+              {t("doneBtn")}
+            </button>
+          </div>
+        ) : (
+          <>
+            <div className="mb-4 flex items-start justify-between">
+              <div className="flex items-center gap-2">
+                <span className="flex h-9 w-9 items-center justify-center rounded-full bg-[var(--accent-strong)] text-white"><Package size={18} /></span>
+                <div>
+                  <h3 id="order-dialog-title" className="font-serif text-xl text-[var(--text-primary)]">{t("title")}</h3>
+                  <p className="text-[11px] text-[var(--text-secondary)]">{productLabel}{summary.size ? ` · ${summary.size}` : ""}</p>
+                </div>
+              </div>
+              <button onClick={onClose} aria-label={t("aria.close")} className="rounded-lg p-1 text-[var(--text-secondary)] hover:bg-black/5"><X size={20} /></button>
+            </div>
+
+            <div className="space-y-3">
+              {/* Мʼяка пропозиція входу: зберегти модель у кабінеті + бачити статус
+                  замовлення. НЕ блокує — гостьове замовлення далі працює. */}
+              {user ? (
+                <div className="flex items-center gap-2 rounded-2xl border border-[rgba(47,74,60,0.18)] bg-[rgba(47,74,60,0.06)] px-3 py-2 text-[12px] leading-4 text-[var(--text-primary)]">
+                  <CheckCircle2 size={15} className="shrink-0 text-[var(--accent-strong)]" />
+                  <span>{t("savedToAccount", { email: user.email || "" })}</span>
+                </div>
+              ) : (
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-[rgba(142,107,61,0.28)] bg-[rgba(142,107,61,0.08)] px-3 py-2 text-[12px] leading-4 text-[var(--text-primary)]">
+                  <span className="min-w-0 flex-1">{t("loginPrompt")}</span>
+                  <button
+                    type="button"
+                    onClick={() => { try { signIn(); } catch { /* ignore */ } }}
+                    className="shrink-0 rounded-full bg-[var(--accent-strong)] px-3 py-1.5 text-[12px] font-bold text-white hover:opacity-90"
+                  >
+                    {t("loginCta")}
+                  </button>
+                </div>
+              )}
+              {modelPending && (
+                <div className="flex items-center gap-2 rounded-2xl border border-[rgba(11,92,87,0.2)] bg-[rgba(15,118,110,0.07)] px-3 py-2 text-[12px] leading-4 text-[var(--text-primary)]">
+                  <span aria-hidden>🛠</span>
+                  <span>{t("modelPending")}</span>
+                </div>
+              )}
+              {/* F-14: видимі лейбли над полями (placeholder зникає при наборі). */}
+              <p className="px-1 text-[11px] font-semibold uppercase tracking-wide text-[var(--text-secondary)]">{t("contactsHeading")}</p>
+              <label className="block">
+                <span className="mb-1 block px-1 text-[12px] font-semibold text-[var(--text-primary)]">{t("phName")}</span>
+                <input ref={firstInputRef} className={fieldCls} placeholder={t("phName")} id="order-name" onBlur={onBlurValidate("name")} {...errAttrs("name")} value={name} onChange={(e) => setName(e.target.value)} autoComplete="name" />
+              </label>
+              <label className="block">
+                <span className="mb-1 block px-1 text-[12px] font-semibold text-[var(--text-primary)]">{t("phPhone")}</span>
+                <input className={fieldCls} placeholder="+380 93 000 00 00" id="order-phone" onBlur={onBlurValidate("phone")} {...errAttrs("phone")} value={phone} onChange={(e) => setPhone(e.target.value)} inputMode="tel" autoComplete="tel" />
+              </label>
+              {/* Email необовʼязковий — для підтвердження замовлення на пошту. */}
+              <label className="block">
+                <span className="mb-1 block px-1 text-[12px] font-semibold text-[var(--text-primary)]">{t("phEmail")}</span>
+                <input className={fieldCls} placeholder="name@example.com" id="order-email" onBlur={onBlurValidate("email")} {...errAttrs("email")} value={email} onChange={(e) => setEmail(e.target.value)} inputMode="email" type="email" autoComplete="email" />
+              </label>
+
+              <div className="space-y-1.5">
+                <p className="px-1 text-[11px] font-semibold uppercase tracking-wide text-[var(--text-secondary)]">{t("deliveryHeading")}</p>
+                {/* Лише Україна (рішення власника 2026-09-02) — чесно кажемо це одразу,
+                    щоб відвідувач з-за кордону не заповнював форму даремно. */}
+                <p className="px-1 text-[11px] leading-4 text-[var(--text-secondary)]">{t("uaOnly")}</p>
+                <div role="radiogroup" aria-label={t("aria.method")} className="flex items-center gap-2 rounded-2xl border border-[var(--surface-border)] bg-white/70 p-1 text-xs">
+                  {([["nova", t("nova")], ["ukr", t("ukr")]] as [Delivery, string][]).map(([k, lbl]) => (
+                    <button key={k} type="button" role="radio" aria-checked={delivery === k} onClick={() => setDelivery(k)}
+                      className={`flex-1 min-h-11 rounded-xl px-2 py-2 text-sm font-semibold transition ${delivery === k ? "bg-[var(--accent-strong)] text-white" : "text-[var(--text-secondary)]"}`}>
+                      {lbl}
+                    </button>
+                  ))}
+                </div>
+                <p className="px-1 text-[11px] leading-4 text-[var(--text-secondary)]">{t("deliveryHint")}</p>
+                {/* Орієнтовна вартість доставки за тарифом перевізника (2025-12):
+                    НП ~70₴, Укрпошта ~45₴, ЄС ~€8 — знімає страх «приховані витрати». */}
+                <p className="px-1 text-[11px] font-semibold leading-4 text-[var(--accent-strong)]">
+                  {delivery === "pickup"
+                    ? t("costPickup")
+                    : delivery === "nova"
+                      ? t("costNova")
+                      : t("costUkr")}
+                </p>
+              </div>
+
+              {delivery !== "pickup" && (
+                delivery === "nova" ? (
+                  // Нова Пошта: пошук міста + відділення через API (фолбек на ручне
+                  // введення, якщо ключ NOVA_POSHTA_API_KEY не налаштовано на сервері).
+                  <NovaPoshtaPicker city={city} branch={branch} setCity={setCity} setBranch={setBranch} inputCls={fieldCls} />
+                ) : (
+                <>
+                  <input className={fieldCls} placeholder={t("phCity")} aria-label={t("phCity")} id="order-city" onBlur={onBlurValidate("city")} {...errAttrs("city")} value={city} onChange={(e) => setCity(e.target.value)} />
+                  <input className={fieldCls} placeholder={t("phUkr")} aria-label={t("phUkr")} id="order-branch" onBlur={onBlurValidate("branch")} {...errAttrs("branch")} value={branch} onChange={(e) => setBranch(e.target.value)} />
+                  <input className={fieldCls} placeholder={t("phAddress")} aria-label={t("phAddress")} id="order-address" onBlur={onBlurValidate("address")} {...errAttrs("address")} value={address} onChange={(e) => setAddress(e.target.value)} />
+                </>
+                )
+              )}
+
+              <textarea className={`${fieldCls} min-h-[64px] resize-none`} placeholder={t("phComment")} aria-label={t("phComment")} value={comment} onChange={(e) => setComment(e.target.value)} />
+
+              {/* Ціна переїхала у sticky-футер (завжди на видноті, без скролу до кінця);
+                  тут лишилось ЩО входить у ціну — знімає страх «а доставка окремо?». */}
+              <p className="rounded-2xl border border-[rgba(176,141,87,0.35)] bg-[rgba(176,141,87,0.16)] px-4 py-3 text-[12px] leading-5 text-[var(--text-secondary)]">{t("priceIncludes")}</p>
+
+              <div className="flex items-start gap-2 rounded-2xl bg-[rgba(46,74,58,0.06)] px-3 py-2.5 text-[12px] leading-5 text-[var(--text-secondary)]">
+                <Truck size={14} className="mt-0.5 shrink-0 text-[var(--accent-strong)]" />
+                <span>
+                  {/* UX: чіткі строки знімають головний страх «коли отримаю?» */}
+                  <b className="text-[var(--text-primary)]">{t("leadTime")}</b>
+                  {" — "}
+                  {t("paymentNote")}
+                </span>
+              </div>
+
+              {/* Сигнали довіри — знижують відмову на останньому кроці воронки:
+                  замовлення без передоплати, оператор підтверджує, дані захищені. */}
+              {/* T-2.2 (F-14): довгі trust-блоки згорнуто — між полями і CTA менше прокрутки;
+                  один рядок-резюме лишається видимим. */}
+              <details className="group rounded-2xl border border-[rgba(11,92,87,0.16)] bg-[rgba(15,118,110,0.05)] px-3 py-2 text-[12px] leading-5 text-[var(--text-secondary)]">
+                <summary className="flex cursor-pointer list-none items-center gap-2 font-semibold text-[var(--text-primary)]">
+                  <ShieldCheck size={13} className="shrink-0 text-[var(--accent-strong)]" />
+                  <span className="flex-1">{t("trustMore")}</span>
+                  <span aria-hidden className="text-[var(--text-secondary)] transition group-open:rotate-180">⌄</span>
+                </summary>
+                <ul className="mt-2 grid gap-1.5">
+                  <li className="flex items-center gap-2"><ShieldCheck size={13} className="shrink-0 text-[var(--accent-strong)]" /><span><b className="text-[var(--text-primary)]">{t("trustGuarantee")}</b> — {t("trustGuaranteeDesc")}</span></li>
+                  <li className="flex items-center gap-2"><Wallet size={13} className="shrink-0 text-[var(--accent-strong)]" /><span><b className="text-[var(--text-primary)]">{t("trustNoPrepay")}</b> — {t("trustNoPrepayDesc")}</span></li>
+                  <li className="flex items-center gap-2"><PhoneCall size={13} className="shrink-0 text-[var(--accent-strong)]" /><span>{t("trustOperator")}</span></li>
+                  <li className="flex items-center gap-2"><Lock size={13} className="shrink-0 text-[var(--accent-strong)]" /><span>{t("trustSecure")}</span></li>
+                  <li className="flex items-center gap-2"><ShieldCheck size={12} className="shrink-0 text-[var(--accent-strong)]" /><span>{t("submitReassure")}</span></li>
+                </ul>
+              </details>
+              {/* S-1: альтернатива формі — чат у Telegram (для тих, хто не любить форми). */}
+              <a
+                href="https://t.me/monadruk"
+                target="_blank"
+                rel="noopener"
+                data-testid="order-msg-alt"
+                onClick={() => { import("@/lib/analytics").then((m) => m.track("messenger_order", { channel: "tg", product: productType, at: "form" })).catch(() => {}); }}
+                className="block px-1 text-center text-[11.5px] leading-snug text-[var(--text-secondary)] underline decoration-dotted underline-offset-2 hover:text-[var(--accent-strong)]"
+              >
+                {t("msgAlt")}
+              </a>
+
+              {/* Sticky-футер: ЦІНА + CTA завжди на видноті — не треба скролити крізь
+                  усю форму до кнопки. Лишається приклеєним до низу скрол-панелі. */}
+              <div className="sticky bottom-0 -mx-5 -mb-5 border-t border-[var(--surface-border)] bg-[var(--surface-panel,#fff)] px-5 pb-4 pt-3">
+                {error && (
+                  <div id="order-error" role="alert" className="mb-2 flex items-center justify-between gap-2 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+                    <span>{error}</span>
+                    {/* F-14: мережева помилка — кнопка «Повторити» з тим самим payload. */}
+                    {error === t("sendFail") && (
+                      <button type="button" onClick={submit} className="shrink-0 rounded-full border border-red-300 bg-white px-3 py-1 text-[12px] font-semibold text-red-700">
+                        {t("retry")}
+                      </button>
+                    )}
+                  </div>
+                )}
+                <div className="mb-2 flex items-center justify-between">
+                  <span className="text-[12px] font-semibold text-[var(--text-secondary)]">{t("estPriceLabel")}</span>
+                  <b className="text-[17px] font-extrabold text-[var(--text-primary)]">{priceText || fallbackPrice}</b>
+                </div>
+                <button onClick={submit} disabled={sending}
+                  className="inline-flex min-h-[52px] w-full items-center justify-center gap-2 rounded-full bg-[var(--accent-strong)] px-5 py-3.5 text-sm font-bold text-white shadow-[0_16px_32px_rgba(11,92,87,0.24)] transition hover:bg-[var(--accent)] disabled:opacity-60">
+                  {sending ? (<><Loader2 className="h-4 w-4 animate-spin" /> {t("sending")}</>) : t("submit")}
+                </button>
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+
+  if (typeof document === "undefined") return null;
+  return createPortal(dialog, document.body);
+}

@@ -1,0 +1,177 @@
+"use client";
+export const dynamic = "force-dynamic";
+
+import Link from "next/link";
+import { useEffect, useState } from "react";
+import { useTranslations } from "next-intl";
+import { CheckCircle2, Loader2, Clock, ArrowRight, Home, LayoutGrid } from "lucide-react";
+import { track } from "@/lib/analytics";
+import { Button, buttonClasses } from "@/components/ui/Button";
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
+
+type PayState = "checking" | "paid" | "pending" | "unknown";
+
+export default function OrderSuccessPage() {
+  const t = useTranslations("orderSuccess");
+  const tOrder = useTranslations("order");
+  const [order, setOrder] = useState<string>("");
+  const [state, setState] = useState<PayState>("checking");
+  const [copied, setCopied] = useState(false);
+  // Чек, збережений OrderDialog у цьому браузері (mnd_pay_<номер>): дає змогу
+  // доплатити, якщо людина пішла на LiqPay і не завершила оплату.
+  const [savedPay, setSavedPay] = useState<any>(null);
+  // ⭐10.09.2026: покупка ФАЙЛУ. Оплата йде БЕЗ входу в акаунт (чек просить лише
+  // пошту), тож повернувшись сюди людина мусить отримати файл просто тут —
+  // інакше вона заплатила й лишилась ні з чим.
+  const [fileTaskId, setFileTaskId] = useState<string>("");
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const ord = (params.get("order") || "").trim();
+    setOrder(ord);
+    try {
+      const raw = ord ? localStorage.getItem(`mnd_pay_${ord}`) : null;
+      if (raw) setSavedPay(JSON.parse(raw));
+    } catch { /* приватний режим */ }
+    track("view", { id: "order_success", order: ord });
+    if (!ord) { setState("unknown"); return; }
+
+    let cancelled = false;
+    let tries = 0;
+    // Опитуємо серверну перевірку статусу LiqPay кілька разів: платіж міг щойно
+    // завершитись, а статус в API зʼявляється з невеликою затримкою.
+    const poll = async () => {
+      tries += 1;
+      try {
+        const r = await fetch(`${API_BASE}/api/liqpay/status/${encodeURIComponent(ord)}`, { cache: "no-store" });
+        const d = await r.json();
+        if (cancelled) return;
+        if (d?.paid) {
+          setState("paid");
+          if (d?.task_id) setFileTaskId(String(d.task_id));
+          track("order_paid_confirmed", { order: ord });
+          return;
+        }
+        if (tries < 5) { setTimeout(poll, 2000); return; }
+        setState(d?.configured === false ? "unknown" : "pending");
+      } catch {
+        if (cancelled) return;
+        if (tries < 5) { setTimeout(poll, 2000); return; }
+        setState("pending");
+      }
+    };
+    poll();
+    return () => { cancelled = true; };
+  }, []);
+
+  const isPaid = state === "paid";
+  const isChecking = state === "checking";
+
+  return (
+    <div className="mx-auto flex min-h-[100dvh] max-w-[720px] flex-col items-center px-5 py-16 text-center lg:py-24">
+      <div className="flex h-20 w-20 items-center justify-center rounded-full" style={{
+        background: isPaid ? "color-mix(in srgb, var(--forest,#2F4A3C) 12%, transparent)"
+          : "color-mix(in srgb, var(--bronze,#8E6B3D) 12%, transparent)",
+      }}>
+        {isChecking ? <Loader2 className="h-9 w-9 animate-spin text-[var(--bronze,#8E6B3D)]" />
+          : isPaid ? <CheckCircle2 className="h-10 w-10 text-[var(--forest,#2F4A3C)]" />
+          : <Clock className="h-9 w-9 text-[var(--bronze,#8E6B3D)]" />}
+      </div>
+
+      <h1 className="mt-6 font-serif text-[clamp(28px,5vw,44px)] leading-tight text-ink">
+        {isChecking ? t("checkingTitle") : isPaid ? t("paidTitle") : t("pendingTitle")}
+      </h1>
+
+      {order && (
+        <p className="mt-2 flex flex-wrap items-center justify-center gap-2 text-[15px] text-ink-2">
+          <span>
+            {t("orderLabel")} <span className="font-semibold text-ink">#{order}</span>
+          </span>
+          <Button
+            variant="bronze"
+            size="sm"
+            onClick={() => {
+              try {
+                navigator.clipboard?.writeText(String(order));
+                setCopied(true);
+                setTimeout(() => setCopied(false), 2000);
+              } catch { /* ignore */ }
+            }}
+            className="rounded-full border border-line px-3 py-1 text-[12px] font-semibold text-ink-2 hover:text-ink"
+          >
+            {copied ? `✓ ${tOrder("copied")}` : tOrder("copyNo")}
+          </Button>
+        </p>
+      )}
+
+      <p className="mt-4 max-w-[520px] text-[15px] leading-relaxed text-ink-2">
+        {isChecking ? t("checkingBody") : isPaid ? t("paidBody") : t("pendingBody")}
+      </p>
+
+      {/* ⭐10.09.2026: оплачений ФАЙЛ віддаємо просто тут. Покупець платив без
+          акаунта (чек просить лише пошту), а звичайне завантаження вимагає
+          входу з підтвердженою поштою — тобто після оплати він упирався б у
+          стіну. Посилання лишається робочим і потім: доступ прив'язаний до
+          моделі, а не до сесії. */}
+      {isPaid && fileTaskId && (
+        <div className="mt-6 flex flex-col items-center gap-2" data-testid="paid-file">
+          <a
+            href={`${API_BASE}/api/file/download/${encodeURIComponent(fileTaskId)}`}
+            className={buttonClasses("primary", "md")}
+            data-testid="paid-file-download"
+          >
+            {t("fileDownload")}
+          </a>
+          <p className="max-w-[420px] text-center text-[12.5px] leading-snug text-ink-2">
+            {t("fileKeepLink")}
+          </p>
+        </div>
+      )}
+
+      {state === "pending" && savedPay && (
+        <div className="mt-5 flex flex-col items-center gap-1">
+          {savedPay.provider === "liqpay" && savedPay.data && savedPay.signature ? (
+            <form action={savedPay.action_url} method="POST" acceptCharset="utf-8" target="_blank">
+              <input type="hidden" name="data" value={savedPay.data} />
+              <input type="hidden" name="signature" value={savedPay.signature} />
+              <button type="submit" data-testid="pay-again" className={buttonClasses("primary", "sm")}>
+                {t("payAgain")}
+              </button>
+            </form>
+          ) : savedPay.url ? (
+            <a href={savedPay.url} target="_blank" rel="noopener noreferrer" data-testid="pay-again" className={buttonClasses("primary", "sm")}>
+              {t("payAgain")}
+            </a>
+          ) : null}
+          <span className="text-[12px] text-ink-3">{t("payAgainHint")}</span>
+        </div>
+      )}
+
+      {(isPaid || state === "pending") && (
+        <ul className="mt-6 flex max-w-[460px] flex-col gap-2 text-left">
+          {(["next1", "next2", "next3"] as const).map((k, i) => (
+            <li key={k} className="flex items-start gap-2.5 text-[14px] text-ink-2">
+              <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-[var(--forest,#2F4A3C)]" />
+              <span>{tOrder(k)}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <div className="mt-9 flex flex-wrap items-center justify-center gap-3">
+        <Link href="/account" className={buttonClasses("primary", "sm")}>
+          {t("toAccount")} <ArrowRight className="h-4 w-4" />
+        </Link>
+        <Link href="/create" className={buttonClasses("ghost", "lg")}>
+          <LayoutGrid className="h-4 w-4" /> {t("makeAnother")}
+        </Link>
+        <Link href="/" className={buttonClasses("ghost", "lg")}>
+          <Home className="h-4 w-4" /> {t("toHome")}
+        </Link>
+      </div>
+
+      <p className="mt-8 text-[13px] text-ink-3">{t("support")}</p>
+    </div>
+  );
+}

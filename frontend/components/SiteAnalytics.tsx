@@ -1,0 +1,225 @@
+"use client";
+
+import Script from "next/script";
+import { useEffect, useRef, useState } from "react";
+import { usePathname } from "next/navigation";
+import { useTranslations } from "next-intl";
+import { Link } from "@/i18n/navigation";
+import { GA_ID, GADS_ID, GTAG_ON, META_PIXEL_ID, getConsent, setConsent, track, trackPing, gtagConsentUpdate, clickLabel, campaignParams, shouldReportError, stackHint, isStaleChunkError, reloadOnceForStaleChunk, sendErrorReport } from "@/lib/analytics";
+
+// Що вважати шумом і як витягти кадр стека — у lib/analytics.ts (там же тести).
+// «Connection to Indexed Database server lost» = Firebase Auth persistence у
+// Safari/приватному режимі/кількох вкладках; на роботу сайту не впливає.
+
+/**
+ * GDPR-friendly analytics: shows a localized consent banner; Google Analytics
+ * is loaded ONLY after the visitor accepts (privacy-first — decline = no GA).
+ * Set NEXT_PUBLIC_GA_ID to enable GA; the banner still works without it.
+ */
+export default function SiteAnalytics() {
+  const t = useTranslations("consent");
+  const pathname = usePathname();
+  const [consent, setConsentState] = useState<"granted" | "denied" | null>(null);
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    setConsentState(getConsent());
+    setReady(true);
+    const onChange = (e: Event) => setConsentState((e as CustomEvent).detail);
+    window.addEventListener("mnd:consent", onChange);
+    return () => window.removeEventListener("mnd:consent", onChange);
+  }, []);
+
+  // Page-view tracking (only fires once consent is granted; track() self-guards).
+  // Перший pageview несе кампанія-параметри (utm/gclid/fbclid) з URL приземлення —
+  // атрибуція платного трафіку (раніше зливалось у голий google/facebook referrer).
+  // Без згоди track() шле лише анонімний pageview на власний сервер (без cookie),
+  // тому ефект не чекає згоди; залежить лише від шляху (зміна згоди не дублює pageview).
+  const firstPvRef = useRef(true);
+  useEffect(() => {
+    if (firstPvRef.current) {
+      firstPvRef.current = false;
+      const camp = campaignParams();
+      track("pageview", Object.keys(camp).length ? camp : undefined);
+    } else {
+      track("pageview");
+    }
+  }, [pathname]);
+
+  // Meta Pixel page-view on route change (base pixel + first PageView fire on
+  // script load below; this catches subsequent client-side navigations).
+  useEffect(() => {
+    if (consent !== "granted" || !META_PIXEL_ID) return;
+    const fbq = (window as any).fbq;
+    if (typeof fbq === "function") fbq("track", "PageView");
+  }, [consent, pathname]);
+
+  // Карта кліків: де користувачі тикають (нормовані % в'юпорта) + підпис елемента.
+  // Допомагає зрозуміти, що приваблює увагу й де люди «застрягають». Капи на сесію,
+  // щоб не роздути лог. track() сам гейтить за згодою/власником/dev.
+  useEffect(() => {
+    if (consent !== "granted") return;
+    let n = 0;
+    const onClick = (e: MouseEvent) => {
+      if (n >= 50) return; // максимум 50 кліків на завантаження сторінки
+      const vw = Math.max(window.innerWidth, 1), vh = Math.max(window.innerHeight, 1);
+      const x = Math.round((e.clientX / vw) * 1000) / 10; // % з 0.1 точністю
+      const y = Math.round((e.clientY / vh) * 1000) / 10;
+      n++;
+      track("click", { x, y, el: clickLabel(e.target).slice(0, 48) });
+    };
+    document.addEventListener("click", onClick, { passive: true, capture: true });
+    return () => document.removeEventListener("click", onClick, { capture: true } as any);
+  }, [consent, pathname]);
+
+  // 09.11.2026: перехід у месенджер/пошту = звернення (лід) → конверсія «Contact» у
+  // Google Ads. Для гір ціна «за запитом», тож уся «продажа» йде через Telegram, а
+  // реклама досі цього не бачила. Один раз на завантаження сторінки. Без згоди
+  // trackConversion сам обмежується: Consent Mode моделює конверсію без cookie.
+  useEffect(() => {
+    let sent = false;
+    const onLead = (e: MouseEvent) => {
+      if (sent) return;
+      const a = (e.target as HTMLElement | null)?.closest?.("a[href]") as HTMLAnchorElement | null;
+      if (!a || !/^(https?:\/\/(t\.me|ig\.me|m\.me|wa\.me)\/|mailto:|viber:|tg:)/i.test(a.href)) return;
+      sent = true;
+      import("@/lib/analytics").then(({ trackConversion }) =>
+        trackConversion("contact", { props: { via: a.href.replace(/^[a-z]+:\/*/i, "").split(/[/?]/)[0].slice(0, 20), page: pathname || "" } }),
+      ).catch(() => {});
+    };
+    document.addEventListener("click", onLead, { passive: true, capture: true });
+    return () => document.removeEventListener("click", onLead, { capture: true } as any);
+  }, [pathname]);
+
+  // Серцебиття присутності: поки вкладка ВИДИМА, раз на 30с шлемо «ping», щоб
+  // бекенд рахував РЕАЛЬНИЙ час на сайті (а не лише проміжок між кліками — інакше
+  // хто прочитав одну сторінку без кліків показувався б як 0 хв). Пауза, коли
+  // вкладку приховано (перемкнули таб) → рахуємо лише активний час. Фінальний ping
+  // при відході ловить останній відрізок (тож короткі візити точні й без інтервалу).
+  // 30с (а не 15с) удвічі менше роздуває лог; кап 240/завантаження (~2 год).
+  // track()-гарди (dev/згода/власник) — всередині trackPing().
+  useEffect(() => {
+    let pings = 0;
+    // Гейт БЕЗДІЯЛЬНОСТІ: раніше видима-але-покинута вкладка (юзер відійшов, таб
+    // на передньому плані) продовжувала пінгувати ~2 год і роздувала «час на сайті».
+    // Тепер пінгуємо лише якщо була реальна активність за останні IDLE_MS.
+    const IDLE_MS = 5 * 60 * 1000;
+    let lastActivity = Date.now();
+    const bump = () => { lastActivity = Date.now(); };
+    const acts = ["mousemove", "mousedown", "keydown", "scroll", "touchstart"];
+    acts.forEach((e) => window.addEventListener(e, bump, { passive: true }));
+    const beat = () => {
+      if (document.visibilityState !== "visible") return;
+      if (Date.now() - lastActivity > IDLE_MS) return; // видима, але покинута
+      if (pings >= 240) return;
+      pings++;
+      trackPing();
+    };
+    const id = window.setInterval(beat, 30000);
+    const onHidden = () => { if (document.visibilityState === "hidden") trackPing(); };
+    const onLeave = () => trackPing();
+    document.addEventListener("visibilitychange", onHidden);
+    window.addEventListener("pagehide", onLeave);
+    return () => {
+      window.clearInterval(id);
+      acts.forEach((e) => window.removeEventListener(e, bump));
+      document.removeEventListener("visibilitychange", onHidden);
+      window.removeEventListener("pagehide", onLeave);
+    };
+  }, []);
+
+  // Google Consent Mode v2: push the consent decision to gtag (Ads/GA4). Default
+  // is denied (set in the init script) → conversions modelled cookielessly until accept.
+  useEffect(() => {
+    if (consent === "granted") gtagConsentUpdate(true);
+    else if (consent === "denied") gtagConsentUpdate(false);
+  }, [consent]);
+
+  // Free self-hosted error monitoring (Sentry alternative): report uncaught JS
+  // errors to /api/track. No PII, throttled. Visible in /admin → topEvents.
+  useEffect(() => {
+    const report = (msg: string, src?: string) => {
+      // 16.09: чанк з іншого білда (вкладка пережила деплой) → один reload, і
+      // подія `stale_chunk_reload`, щоб бачити, скільки людей це зачепило.
+      const stale = isStaleChunkError(String(msg), String(src || ""));
+      if (!stale && !shouldReportError(String(msg), String(src || ""))) return;
+      // ліміт 10/вкладку і «не логуємо власника» — усередині sendErrorReport
+      sendErrorReport(stale ? "stale_chunk_reload" : "js_error", String(msg), String(src || ""));
+      if (stale) reloadOnceForStaleChunk();
+    };
+    const onErr = (e: ErrorEvent) => report(e.message, `${e.filename}:${e.lineno}`);
+    // ⭐09.09: раніше тут не передавали ДРУГИЙ аргумент — усі 19 помилок у логу
+    // прийшли з порожнім `src`, тож найчастішу («reading 'map'», 8 разів)
+    // не було де шукати. Тепер беремо перший кадр стека самої причини.
+    const onRej = (e: PromiseRejectionEvent) =>
+      report(`unhandledrejection: ${e.reason}`, stackHint(e.reason));
+    window.addEventListener("error", onErr);
+    window.addEventListener("unhandledrejection", onRej);
+    return () => { window.removeEventListener("error", onErr); window.removeEventListener("unhandledrejection", onRej); };
+  }, []);
+
+  const decide = (v: "granted" | "denied") => { setConsent(v); setConsentState(v); };
+
+  return (
+    <>
+      {/* gtag.js (GA4 + Google Ads). Loaded once any Google ID is set. Consent Mode v2:
+          default DENIED → cookieless modelled conversions until the visitor accepts. */}
+      {GTAG_ON && (
+        <>
+          {/* N-1 (перф, 2026-09-06): gtag.js = 340 КБ JS на КОЖНІЙ сторінці (Fast-3G/4×CPU: LCP
+              /create 6.5 с). lazyOnload → після load+idle; ga-init нижче лишається
+              afterInteractive — stub `gtag()` черга події до приходу бібліотеки, нічого не губиться. */}
+          <Script src={`https://www.googletagmanager.com/gtag/js?id=${GA_ID || GADS_ID}`} strategy="lazyOnload" />
+          <Script id="ga-init" strategy="afterInteractive">
+            {`window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());` +
+              `gtag('consent','default',{ad_storage:'denied',ad_user_data:'denied',ad_personalization:'denied',analytics_storage:'denied',wait_for_update:500});` +
+              // returning visitor, що вже погодився → застосувати granted ОДРАЗУ (синхронно,
+              // до config) — інакше update з React-ефекту міг загубитись через гонку завантаження.
+              `var _mc=document.cookie.match(/mnd_consent=(granted|denied)/);if(_mc&&_mc[1]==='granted'){gtag('consent','update',{ad_storage:'granted',ad_user_data:'granted',ad_personalization:'granted',analytics_storage:'granted'});}` +
+              (GA_ID ? `gtag('config','${GA_ID}',{anonymize_ip:true});` : ``) +
+              (GADS_ID ? `gtag('config','${GADS_ID}');` : ``)}
+          </Script>
+        </>
+      )}
+
+      {/* Meta Pixel — loaded ONLY after explicit consent (no cookieless modelling
+          equivalent to Google Consent Mode exists for Meta, so this is the privacy-safe
+          gate). Dormant until NEXT_PUBLIC_META_PIXEL_ID is set. */}
+      {consent === "granted" && META_PIXEL_ID && (
+        <Script id="meta-pixel-init" strategy="afterInteractive">
+          {`!function(f,b,e,v,n,t,s){if(f.fbq)return;n=f.fbq=function(){n.callMethod?n.callMethod.apply(n,arguments):n.queue.push(arguments)};if(!f._fbq)f._fbq=n;n.push=n;n.loaded=!0;n.version='2.0';n.queue=[];t=b.createElement(e);t.async=!0;t.src=v;s=b.getElementsByTagName(e)[0];s.parentNode.insertBefore(t,s)}(window,document,'script','https://connect.facebook.net/en_US/fbevents.js');` +
+            `fbq('init','${META_PIXEL_ID}');fbq('track','PageView');`}
+        </Script>
+      )}
+
+      {ready && consent === null && (
+        // F-17/F-12b: банер більше НЕ перекриває CTA — на mobile компактна смужка
+        // ЗВЕРХУ, на desktop маленька картка ліворуч унизу (праворуч живуть CTA/ціна/чат).
+        // top-[72px] на мобільному: банер стоїть ПІД шапкою, тож логотип/меню
+        // лишаються клікабельними до вибору (раніше банер їх накривав).
+        // Конструктори (/create, /keychains): зліва внизу тепер прилипла головна кнопка
+        // «Показати 3D» — картку згоди ставимо праворуч, лівіше від кнопки чату.
+        <div className={`fixed inset-x-2 top-[72px] z-[50] rounded-2xl border border-line bg-paper/95 p-3 shadow-lift backdrop-blur sm:inset-x-auto sm:bottom-3 sm:top-auto sm:max-w-[360px] ${/\/(create|keychains)(\/|$)/.test(pathname || "") ? "sm:right-24" : "sm:left-4"}`}>
+          <p className="text-[12px] leading-snug text-ink-2">
+            {t("text")}{" "}
+            <Link href="/privacy" className="font-semibold text-forest underline">{t("more")}</Link>
+          </p>
+          <div className="mt-2 flex shrink-0 gap-2">
+            <button
+              onClick={() => decide("denied")}
+              className="min-h-[40px] flex-1 rounded-full border border-line px-3 text-[12px] font-semibold text-ink-2 transition hover:border-forest/40"
+            >
+              {t("decline")}
+            </button>
+            <button
+              onClick={() => decide("granted")}
+              className="min-h-[40px] flex-1 rounded-full bg-forest px-4 text-[12px] font-bold text-[#F4EFE4] transition hover:brightness-110"
+            >
+              {t("accept")}
+            </button>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}

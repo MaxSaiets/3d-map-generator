@@ -1,0 +1,256 @@
+// SEO-проза для builder-сторінок (/create, /keychains, /worlds): це client-side
+// конструктори майже без індексованого тексту, хоча саме вони таргетять грошові
+// запити. Серверний текст-блок рендериться ПІД конструктором (нижче згину) —
+// краулер бачить контент, користувач UI не втрачає.
+//
+// ТЕПЕР повні 6 локалей (uk/en/de/pl/fr/es). Селектор бере локаль, якщо є, інакше
+// м'який фолбек на en — тож додавання/пропуск локалі ніколи не ламає рендер.
+
+export type SeoProse = { h2: string; p1: string; p2: string };
+
+const CREATE: Record<string, SeoProse> = {
+  uk: {
+    h2: "Онлайн-конструктор 3D-мапи міста",
+    p1: "Monadruk перетворює будь-яку точку світу на друковану 3D-модель: оберіть район на карті — і за кілька хвилин отримаєте тривимірну мапу з реальними висотами будинків, вулицями, парками й річками за даними OpenStreetMap. Для горбистих міст можна ввімкнути рельєф місцевості, а серію сусідніх плиток — з'єднати у настінне панно.",
+    p2: "Готову модель друкуємо з екологічного біопластику Eco PLA у розмірах від 5,5 до 15 см (ціна від 350 ₴) і надсилаємо Новою Поштою по Україні. Якщо у вас є власний 3D-принтер — купіть готовий файл 3MF (149 ₴) і надрукуйте вдома; 3D-превʼю перед покупкою безкоштовне.",
+  },
+  en: {
+    h2: "Online 3D city map builder",
+    p1: "Monadruk turns any point on Earth into a printable 3D model: pick a district on the map and in minutes get a three-dimensional map with real building heights, streets, parks and rivers from OpenStreetMap data. Hilly cities can be rendered with true terrain relief, and adjacent tiles can be joined into a wall panel.",
+    p2: "We print the finished model in eco-friendly Eco PLA in sizes from 5.5 to 15 cm (from ≈€8) and ship across Ukraine. Have your own 3D printer? Buy the print-ready 3MF file (149 ₴ ≈ €3, works worldwide) and print at home — the 3D preview is free.",
+  },
+  de: {
+    h2: "Online-Konfigurator für 3D-Stadtkarten",
+    p1: "Monadruk verwandelt jeden Punkt der Erde in ein druckbares 3D-Modell: Wähle ein Viertel auf der Karte und erhalte in wenigen Minuten eine dreidimensionale Karte mit echten Gebäudehöhen, Straßen, Parks und Flüssen aus OpenStreetMap-Daten. Für hügelige Städte lässt sich das Geländerelief aktivieren, und benachbarte Kacheln können zu einem Wandpanel zusammengefügt werden.",
+    p2: "Das fertige Modell drucken wir aus umweltfreundlichem Eco PLA in Größen von 5,5 bis 15 cm (ab ≈8 €) und versenden es innerhalb der Ukraine. Du hast einen eigenen 3D-Drucker? Kauf die druckfertige 3MF-Datei (149 ₴ ≈ 3 €, weltweit) und drucke zu Hause — die 3D-Vorschau ist kostenlos.",
+  },
+  pl: {
+    h2: "Kreator mapy miasta 3D online",
+    p1: "Monadruk zamienia dowolny punkt na Ziemi w drukowalny model 3D: wybierz dzielnicę na mapie, a w kilka minut otrzymasz trójwymiarową mapę z rzeczywistymi wysokościami budynków, ulicami, parkami i rzekami na podstawie danych OpenStreetMap. Dla pagórkowatych miast można włączyć rzeźbę terenu, a sąsiednie kafle połączyć w panel ścienny.",
+    p2: "Gotowy model drukujemy z ekologicznego bioplastiku Eco PLA w rozmiarach od 5,5 do 15 cm (od ≈8 €) i wysyłamy na Ukrainę. Masz własną drukarkę 3D? Kup gotowy plik 3MF (149 ₴ ≈ 3 €, dostępny na całym świecie) i wydrukuj w domu — podgląd 3D jest bezpłatny.",
+  },
+  fr: {
+    h2: "Configurateur de carte de ville 3D en ligne",
+    p1: "Monadruk transforme n'importe quel point du globe en un modèle 3D imprimable : choisissez un quartier sur la carte et obtenez en quelques minutes une carte tridimensionnelle avec les hauteurs réelles des bâtiments, les rues, les parcs et les rivières d'après les données OpenStreetMap. Pour les villes vallonnées, le relief du terrain peut être activé, et des tuiles voisines assemblées en un panneau mural.",
+    p2: "Nous imprimons le modèle fini en Eco PLA écologique, en tailles de 5,5 à 15 cm (à partir de ≈8 €), et l'expédions en Ukraine. Vous avez votre propre imprimante 3D ? Achetez le fichier 3MF prêt à imprimer (149 ₴ ≈ 3 €, partout dans le monde) et imprimez chez vous — l'aperçu 3D est gratuit.",
+  },
+  es: {
+    h2: "Configurador de mapa de ciudad 3D en línea",
+    p1: "Monadruk convierte cualquier punto de la Tierra en un modelo 3D imprimible: elige un distrito en el mapa y en minutos obtén un mapa tridimensional con alturas reales de edificios, calles, parques y ríos a partir de datos de OpenStreetMap. Para ciudades con colinas se puede activar el relieve del terreno, y unir baldosas vecinas en un panel de pared.",
+    p2: "Imprimimos el modelo terminado en Eco PLA ecológico, en tamaños de 5,5 a 15 cm (desde ≈8 €), y lo enviamos dentro de Ucrania. ¿Tienes tu propia impresora 3D? Compra el archivo 3MF listo para imprimir (149 ₴ ≈ 3 €, en todo el mundo) e imprímelo en casa — la vista previa 3D es gratis.",
+  },
+  ro: {
+    h2: "Constructor online de hărți 3D ale orașelor",
+    p1: "Monadruk transformă orice punct de pe Pământ într-un model 3D gata de imprimat: alegi un cartier pe hartă și în câteva minute primești o hartă tridimensională cu înălțimile reale ale clădirilor, străzi, parcuri și râuri din datele OpenStreetMap. Orașele deluroase pot fi redate cu relieful real, iar plăcile vecine se pot îmbina într-un panou de perete.",
+    p2: "Imprimăm modelul finit din Eco PLA ecologic, în dimensiuni de la 5,5 la 15 cm (de la ≈8 €), și îl livrăm în toată Ucraina. Ai propria imprimantă 3D? Cumpără fișierul 3MF gata de imprimat (149 ₴ ≈ 3 €, funcționează oriunde în lume) și imprimă acasă — previzualizarea 3D este gratuită.",
+  },
+};
+
+const KEYCHAINS: Record<string, SeoProse> = {
+  uk: {
+    h2: "Брелок з картою міста на замовлення",
+    p1: "Брелок-мапа — це жетон 55×30 мм з рельєфною картою обраного району: вулиці, парки й річки, які можна відчути пальцями. Додайте власний напис на звороті — назву міста, дату чи координати. Є режим гірського рельєфу (топо-брелок) і брелок з вашим GPX-маршрутом зі Strava чи Garmin.",
+    p2: "Друкуємо з Eco PLA за 2–4 робочі дні, ціна від 170 ₴. Доставка Новою Поштою по Україні. Пара брелоків-«сердець» з районами двох людей з'єднується як пазл — популярний подарунок для пар.",
+  },
+  en: {
+    h2: "Custom city map keychain",
+    p1: "The map keychain is a 55×30 mm tag with a relief map of your chosen district: streets, parks and rivers you can feel with your fingers. Add custom text on the back — a city name, a date or coordinates. There's a mountain-relief topo mode and a keychain with your GPX route from Strava or Garmin.",
+    p2: "Printed in Eco PLA within 2–4 business days, from ≈€4. Shipping across Ukraine and to EU countries. A pair of «heart» keychains with two people's districts joins like a puzzle — a popular couple's gift.",
+  },
+  de: {
+    h2: "Individueller Schlüsselanhänger mit Stadtkarte",
+    p1: "Der Karten-Anhänger ist eine 55×30-mm-Plakette mit einer Reliefkarte deines gewählten Viertels: Straßen, Parks und Flüsse, die man mit den Fingern erfühlen kann. Füge auf der Rückseite eigenen Text hinzu — einen Stadtnamen, ein Datum oder Koordinaten. Es gibt einen Gebirgsrelief-Modus (Topo-Anhänger) und einen Anhänger mit deiner GPX-Route aus Strava oder Garmin.",
+    p2: "Gedruckt aus Eco PLA in 2–4 Werktagen, ab ≈4 €. Versand innerhalb der Ukraine. Ein Paar «Herz»-Anhänger mit den Vierteln zweier Menschen fügt sich wie ein Puzzle zusammen — ein beliebtes Geschenk für Paare.",
+  },
+  pl: {
+    h2: "Brelok z mapą miasta na zamówienie",
+    p1: "Brelok-mapa to zawieszka 55×30 mm z reliefową mapą wybranej dzielnicy: ulice, parki i rzeki, które można poczuć palcami. Dodaj własny napis z tyłu — nazwę miasta, datę lub współrzędne. Jest tryb reliefu górskiego (brelok topo) i brelok z Twoją trasą GPX ze Strava lub Garmin.",
+    p2: "Drukujemy z Eco PLA w 2–4 dni robocze, od ≈4 €. Wysyłka na Ukrainę. Para breloków-«serc» z dzielnicami dwóch osób łączy się jak puzzle — popularny prezent dla par.",
+  },
+  fr: {
+    h2: "Porte-clés personnalisé avec carte de ville",
+    p1: "Le porte-clés carte est une plaque de 55×30 mm avec une carte en relief du quartier choisi : rues, parcs et rivières que l'on peut sentir du bout des doigts. Ajoutez votre texte au dos — un nom de ville, une date ou des coordonnées. Il existe un mode relief de montagne (porte-clés topo) et un porte-clés avec votre parcours GPX de Strava ou Garmin.",
+    p2: "Imprimé en Eco PLA en 1 à 3 jours ouvrés, à partir de ≈4 €. Livraison en Ukraine. Une paire de porte-clés «cœur» avec les quartiers de deux personnes s'assemble comme un puzzle — un cadeau populaire pour les couples.",
+  },
+  es: {
+    h2: "Llavero personalizado con mapa de ciudad",
+    p1: "El llavero mapa es una placa de 55×30 mm con un mapa en relieve del distrito elegido: calles, parques y ríos que se pueden sentir con los dedos. Añade tu propio texto en el reverso — el nombre de una ciudad, una fecha o coordenadas. Hay un modo de relieve montañoso (llavero topo) y un llavero con tu ruta GPX de Strava o Garmin.",
+    p2: "Impreso en Eco PLA en 2–4 días hábiles, desde ≈4 €. Envío dentro de Ucrania. Un par de llaveros «corazón» con los distritos de dos personas encaja como un rompecabezas — un regalo popular para parejas.",
+  },
+  ro: {
+    h2: "Breloc personalizat cu harta orașului",
+    p1: "Brelocul-hartă este o plăcuță de 55×30 mm cu harta în relief a cartierului ales: străzi, parcuri și râuri pe care le simți cu degetele. Adaugă un text pe spate — numele orașului, o dată sau coordonate. Există și un mod topografic cu relief montan și un breloc cu traseul tău GPX din Strava sau Garmin.",
+    p2: "Imprimat din Eco PLA în 2–4 zile lucrătoare, de la ≈4 €. Livrare în toată Ucraina și în țările UE. O pereche de brelocuri «inimă» cu cartierele a doi oameni se îmbină ca un puzzle — un cadou popular pentru cupluri.",
+  },
+};
+
+const WORLDS: Record<string, SeoProse> = {
+  uk: {
+    h2: "AI-генератор фантастичних 3D-світів",
+    p1: "Worlds — експериментальний інструмент Monadruk: опишіть ландшафт словами («вулканічний острів», «глибокий каньйон», «пологі пагорби») — і AI згенерує унікальну 3D-модель рельєфу, якої не існує на реальній карті. На відміну від конструктора мап міст, тут немає прив'язки до OpenStreetMap — лише уява.",
+    p2: "Готову модель можна одразу покрутити в браузері й завантажити файл GLB безкоштовно. Розміри від 8 до 18 см. Для друку такого світу на замовлення — напишіть нам у чат.",
+  },
+  en: {
+    h2: "AI generator of fantasy 3D worlds",
+    p1: "Worlds is an experimental Monadruk tool: describe a landscape in words (\"volcanic island\", \"deep canyon\", \"rolling hills\") and AI generates a unique 3D terrain model that doesn't exist on any real map. Unlike the city map builder, there's no tie to OpenStreetMap here — just imagination.",
+    p2: "Rotate the finished model right in the browser and download the GLB file for free. Sizes from 8 to 18 cm. To order this world printed, message us in chat.",
+  },
+  de: {
+    h2: "KI-Generator für fantastische 3D-Welten",
+    p1: "Worlds ist ein experimentelles Monadruk-Werkzeug: Beschreibe eine Landschaft in Worten („Vulkaninsel“, „tiefer Canyon“, „sanfte Hügel“) und die KI erzeugt ein einzigartiges 3D-Geländemodell, das auf keiner echten Karte existiert. Anders als beim Stadtkarten-Konfigurator gibt es hier keine Bindung an OpenStreetMap — nur Fantasie.",
+    p2: "Drehe das fertige Modell direkt im Browser und lade die GLB-Datei kostenlos herunter. Größen von 8 bis 18 cm. Um diese Welt gedruckt zu bestellen, schreib uns im Chat.",
+  },
+  pl: {
+    h2: "Generator AI fantastycznych światów 3D",
+    p1: "Worlds to eksperymentalne narzędzie Monadruk: opisz krajobraz słowami („wulkaniczna wyspa”, „głęboki kanion”, „łagodne wzgórza”), a AI wygeneruje unikalny model terenu 3D, który nie istnieje na żadnej prawdziwej mapie. W przeciwieństwie do kreatora map miast nie ma tu powiązania z OpenStreetMap — tylko wyobraźnia.",
+    p2: "Gotowy model obróć od razu w przeglądarce i pobierz plik GLB za darmo. Rozmiary od 8 do 18 cm. Aby zamówić wydruk takiego świata, napisz do nas na czacie.",
+  },
+  fr: {
+    h2: "Générateur IA de mondes 3D fantastiques",
+    p1: "Worlds est un outil expérimental de Monadruk : décrivez un paysage en mots (« île volcanique », « canyon profond », « collines douces ») et l'IA génère un modèle de terrain 3D unique qui n'existe sur aucune carte réelle. Contrairement au configurateur de cartes de villes, il n'y a ici aucun lien avec OpenStreetMap — juste l'imagination.",
+    p2: "Faites tourner le modèle fini directement dans le navigateur et téléchargez le fichier GLB gratuitement. Tailles de 8 à 18 cm. Pour commander l'impression de ce monde, écrivez-nous dans le chat.",
+  },
+  es: {
+    h2: "Generador de IA de mundos 3D fantásticos",
+    p1: "Worlds es una herramienta experimental de Monadruk: describe un paisaje con palabras («isla volcánica», «cañón profundo», «colinas suaves») y la IA genera un modelo de terreno 3D único que no existe en ningún mapa real. A diferencia del configurador de mapas de ciudades, aquí no hay vínculo con OpenStreetMap — solo imaginación.",
+    p2: "Gira el modelo terminado directamente en el navegador y descarga el archivo GLB gratis. Tamaños de 8 a 18 cm. Para pedir la impresión de este mundo, escríbenos en el chat.",
+  },
+  ro: {
+    h2: "Generator AI de lumi 3D fantastice",
+    p1: "Lumi este un instrument experimental Monadruk: descrie un peisaj în cuvinte („insulă vulcanică”, „canion adânc”, „dealuri line”) și AI-ul generează un model 3D unic de relief, care nu există pe nicio hartă reală. Spre deosebire de constructorul de hărți ale orașelor, aici nu există legătură cu OpenStreetMap — doar imaginație.",
+    p2: "Rotește modelul finit direct în browser și descarcă gratuit fișierul GLB. Dimensiuni de la 8 la 18 cm. Pentru a comanda imprimarea acestei lumi, scrie-ne în chat.",
+  },
+};
+
+export function seoProse(page: "create" | "keychains" | "worlds", locale: string): SeoProse {
+  const dict = page === "create" ? CREATE : page === "keychains" ? KEYCHAINS : WORLDS;
+  return dict[locale] ?? dict.en;
+}
+
+export type ProseFaqItem = { q: string; a: string };
+
+const CREATE_FAQ: Record<string, ProseFaqItem[]> = {
+  uk: [
+    { q: "Скільки коштує 3D-мапа?", a: "3D-мапа — від 350 ₴ за розмір S (5,5 см) до 1250 ₴ за XL (15 см), рельєф місцевості +100–1000 ₴. Магніт на холодильник — 210 ₴, брелок — від 170 ₴." },
+    { q: "Яку ділянку краще обрати?", a: "Ділянку 400–800 метрів зі змішаною забудовою: трохи вулиць, парк або вода — так район впізнається з першого погляду." },
+    { q: "Скільки триває виготовлення?", a: "2–4 робочі дні на друк, потім доставка Новою Поштою по Україні." },
+    { q: "Чи можна надрукувати самому?", a: "Так — файл 3MF для друку коштує 149 ₴ (3D-превʼю безкоштовне) і одразу відкривається в Bambu Studio чи PrusaSlicer." },
+  ],
+  en: [
+    { q: "How much does a 3D map cost?", a: "A 3D map is from ≈€8 for size S (5.5 cm) to ≈€30 for XL (15 cm), terrain relief +≈€2–24. A fridge magnet is ≈€5, a keychain from ≈€4." },
+    { q: "Which area should I pick?", a: "A 400–800 m area with mixed content: some streets, a park or water — the district stays recognizable at first glance." },
+    { q: "How long does production take?", a: "2–4 business days to print, then shipping across Ukraine." },
+    { q: "Can I print it myself?", a: "Yes — the print-ready 3MF file costs 149 ₴ (≈ €3; the 3D preview is free) and opens directly in Bambu Studio or PrusaSlicer. Sold worldwide." },
+  ],
+  de: [
+    { q: "Was kostet eine 3D-Karte?", a: "Eine 3D-Karte kostet von ≈8 € (Größe S, 5,5 cm) bis ≈30 € (XL, 15 cm), Geländerelief +≈2–24 €. Kühlschrankmagnet ≈5 €, Anhänger ab ≈4 €." },
+    { q: "Welchen Bereich soll ich wählen?", a: "Einen Bereich von 400–800 m mit gemischtem Inhalt: ein paar Straßen, ein Park oder Wasser — so bleibt das Viertel auf den ersten Blick erkennbar." },
+    { q: "Wie lange dauert die Herstellung?", a: "2–4 Werktage Druck, dann Versand in die Ukraine." },
+    { q: "Kann ich es selbst drucken?", a: "Ja — die druckfertige 3MF-Datei kostet 149 ₴ (≈ 3 €; die 3D-Vorschau ist kostenlos) und öffnet direkt in Bambu Studio oder PrusaSlicer. Weltweit erhältlich." },
+  ],
+  pl: [
+    { q: "Ile kosztuje mapa 3D?", a: "Mapa 3D kosztuje od ≈8 € (rozmiar S, 5,5 cm) do ≈30 € (XL, 15 cm), rzeźba terenu +≈2–24 €. Magnes na lodówkę ≈5 €, brelok od ≈4 €." },
+    { q: "Jaki obszar najlepiej wybrać?", a: "Obszar 400–800 m z mieszaną zabudową: trochę ulic, park lub woda — dzielnica pozostaje rozpoznawalna od pierwszego spojrzenia." },
+    { q: "Ile trwa wykonanie?", a: "2–4 dni robocze na druk, potem wysyłka na Ukrainę." },
+    { q: "Czy mogę wydrukować sam?", a: "Tak — gotowy plik 3MF kosztuje 149 ₴ (≈ 3 €; podgląd 3D jest bezpłatny) i otwiera się od razu w Bambu Studio lub PrusaSlicer. Dostępny na całym świecie." },
+  ],
+  fr: [
+    { q: "Combien coûte une carte 3D ?", a: "Une carte 3D coûte de ≈8 € (taille S, 5,5 cm) à ≈30 € (XL, 15 cm), relief du terrain +≈2–24 €. Magnet de frigo ≈5 €, porte-clés dès ≈4 €." },
+    { q: "Quelle zone choisir ?", a: "Une zone de 400 à 800 m au contenu varié : quelques rues, un parc ou de l'eau — le quartier reste reconnaissable au premier coup d'œil." },
+    { q: "Combien de temps prend la fabrication ?", a: "1 à 3 jours ouvrés pour l'impression, puis livraison en Ukraine." },
+    { q: "Puis-je l'imprimer moi-même ?", a: "Oui — le fichier 3MF prêt à imprimer coûte 149 ₴ (≈ 3 € ; l'aperçu 3D est gratuit) et s'ouvre directement dans Bambu Studio ou PrusaSlicer. Vendu partout dans le monde." },
+  ],
+  es: [
+    { q: "¿Cuánto cuesta un mapa 3D?", a: "Un mapa 3D cuesta desde ≈8 € (tamaño S, 5,5 cm) hasta ≈30 € (XL, 15 cm), relieve del terreno +≈2–24 €. Imán de nevera ≈5 €, llavero desde ≈4 €." },
+    { q: "¿Qué zona conviene elegir?", a: "Una zona de 400–800 m con contenido variado: algunas calles, un parque o agua — el distrito sigue siendo reconocible a primera vista." },
+    { q: "¿Cuánto tarda la fabricación?", a: "2–4 días hábiles de impresión, luego envío a Ucrania." },
+    { q: "¿Puedo imprimirlo yo mismo?", a: "Sí — el archivo 3MF listo para imprimir cuesta 149 ₴ (≈ 3 €; la vista previa 3D es gratis) y se abre directamente en Bambu Studio o PrusaSlicer. Se vende en todo el mundo." },
+  ],
+  ro: [
+    { q: "Cât costă o hartă 3D?", a: "O hartă 3D costă de la ≈8 € pentru mărimea S (5,5 cm) până la ≈30 € pentru XL (15 cm), relieful +≈2–24 €. Un magnet de frigider ≈5 €, un breloc de la ≈4 €." },
+    { q: "Ce zonă să aleg?", a: "O zonă de 400–800 m cu conținut variat: câteva străzi, un parc sau apă — așa cartierul rămâne recognoscibil de la prima privire." },
+    { q: "Cât durează realizarea?", a: "2–4 zile lucrătoare pentru imprimare, apoi livrarea în Ucraina." },
+    { q: "Pot să o imprim singur?", a: "Da — fișierul 3MF gata de imprimat costă 149 ₴ (≈ 3 €; previzualizarea 3D este gratuită) și se deschide direct în Bambu Studio sau PrusaSlicer. Se vinde oriunde în lume." },
+  ],
+};
+
+const WORLDS_FAQ: Record<string, ProseFaqItem[]> = {
+  uk: [
+    { q: "Це справжня карта чи вигадана?", a: "Вигадана — AI генерує рельєф із текстового опису, без прив'язки до реальної місцевості." },
+    { q: "Чи можна завантажити файл безкоштовно?", a: "Так, файл GLB для перегляду — безкоштовно. Друк такого світу на замовлення обговорюється окремо в чаті." },
+    { q: "Які розміри доступні?", a: "S (8 см), M (12 см) та L (18 см)." },
+  ],
+  en: [
+    { q: "Is this a real map or a fictional one?", a: "Fictional — AI generates terrain from a text prompt, with no tie to a real location." },
+    { q: "Can I download the file for free?", a: "Yes, the GLB preview file is free. Ordering a print of this world is discussed separately in chat." },
+    { q: "What sizes are available?", a: "S (8 cm), M (12 cm) and L (18 cm)." },
+  ],
+  de: [
+    { q: "Ist das eine echte oder eine erfundene Karte?", a: "Erfunden — die KI erzeugt das Gelände aus einem Textprompt, ohne Bezug zu einem echten Ort." },
+    { q: "Kann ich die Datei kostenlos herunterladen?", a: "Ja, die GLB-Vorschaudatei ist kostenlos. Der Druck dieser Welt auf Bestellung wird separat im Chat besprochen." },
+    { q: "Welche Größen sind verfügbar?", a: "S (8 cm), M (12 cm) und L (18 cm)." },
+  ],
+  pl: [
+    { q: "Czy to prawdziwa mapa, czy fikcyjna?", a: "Fikcyjna — AI generuje teren z opisu tekstowego, bez powiązania z prawdziwym miejscem." },
+    { q: "Czy mogę pobrać plik za darmo?", a: "Tak, plik podglądu GLB jest bezpłatny. Druk takiego świata na zamówienie omawiamy osobno na czacie." },
+    { q: "Jakie rozmiary są dostępne?", a: "S (8 cm), M (12 cm) i L (18 cm)." },
+  ],
+  fr: [
+    { q: "Est-ce une vraie carte ou une carte fictive ?", a: "Fictive — l'IA génère le terrain à partir d'une description textuelle, sans lien avec un lieu réel." },
+    { q: "Puis-je télécharger le fichier gratuitement ?", a: "Oui, le fichier d'aperçu GLB est gratuit. L'impression de ce monde sur commande se discute séparément dans le chat." },
+    { q: "Quelles tailles sont disponibles ?", a: "S (8 cm), M (12 cm) et L (18 cm)." },
+  ],
+  es: [
+    { q: "¿Es un mapa real o ficticio?", a: "Ficticio — la IA genera el terreno a partir de una descripción de texto, sin vínculo con un lugar real." },
+    { q: "¿Puedo descargar el archivo gratis?", a: "Sí, el archivo de vista previa GLB es gratuito. La impresión de este mundo por encargo se trata por separado en el chat." },
+    { q: "¿Qué tamaños hay disponibles?", a: "S (8 cm), M (12 cm) y L (18 cm)." },
+  ],
+  ro: [
+    { q: "Este o hartă reală sau una inventată?", a: "Inventată — AI-ul generează relieful dintr-o descriere text, fără legătură cu un loc real." },
+    { q: "Pot descărca fișierul gratuit?", a: "Da, fișierul GLB de previzualizare este gratuit. Comanda imprimării acestei lumi se discută separat în chat." },
+    { q: "Ce dimensiuni sunt disponibile?", a: "S (8 cm), M (12 cm) și L (18 cm)." },
+  ],
+};
+
+const SHOWCASE_FAQ: Record<string, ProseFaqItem[]> = {
+  uk: [
+    { q: "Це реальні фото чи 3D-рендери?", a: "У галереї є і те, і те: розділ «Як це виглядає надрукованим» — реальні фото готових виробів, решта плиток — інтерактивні 3D-моделі (можна покрутити пальцем чи мишею)." },
+    { q: "З якого матеріалу друкуються ці зразки?", a: "Усі зразки — з біопластику Eco PLA, того самого матеріалу, яким друкуються замовлення покупців." },
+    { q: "Чи можна замовити точно такий самий розмір чи район?", a: "Так — у конструкторі можна обрати будь-яку ділянку та розмір, включно з тими, що показані в галереї." },
+  ],
+  en: [
+    { q: "Are these real photos or 3D renders?", a: "Both: the 'Printed in real life' section shows real photos of finished items, while the rest of the grid is interactive 3D models you can rotate with a finger or mouse." },
+    { q: "What material are these samples printed in?", a: "All samples are printed in Eco PLA bioplastic — the same material used for customer orders." },
+    { q: "Can I order the exact same size or district?", a: "Yes — the builder lets you pick any area and size, including the ones shown in the gallery." },
+  ],
+  de: [
+    { q: "Sind das echte Fotos oder 3D-Renderings?", a: "Beides: Der Bereich „In echt gedruckt“ zeigt echte Fotos fertiger Artikel, der Rest des Rasters sind interaktive 3D-Modelle, die du mit Finger oder Maus drehen kannst." },
+    { q: "Aus welchem Material werden diese Muster gedruckt?", a: "Alle Muster werden aus Eco-PLA-Bioplastik gedruckt — demselben Material wie Kundenbestellungen." },
+    { q: "Kann ich genau dieselbe Größe oder dasselbe Viertel bestellen?", a: "Ja — im Konfigurator lässt sich jeder Bereich und jede Größe wählen, auch die in der Galerie gezeigten." },
+  ],
+  pl: [
+    { q: "Czy to prawdziwe zdjęcia, czy rendery 3D?", a: "Jedno i drugie: sekcja „Jak wygląda wydrukowane” to prawdziwe zdjęcia gotowych wyrobów, a reszta to interaktywne modele 3D, które można obracać palcem lub myszą." },
+    { q: "Z jakiego materiału są te próbki?", a: "Wszystkie próbki są z bioplastiku Eco PLA — tego samego materiału, z którego drukowane są zamówienia klientów." },
+    { q: "Czy mogę zamówić dokładnie taki sam rozmiar lub dzielnicę?", a: "Tak — w kreatorze można wybrać dowolny obszar i rozmiar, w tym te pokazane w galerii." },
+  ],
+  fr: [
+    { q: "Sont-ce de vraies photos ou des rendus 3D ?", a: "Les deux : la section « Imprimé en vrai » montre de vraies photos d'articles finis, le reste de la grille étant des modèles 3D interactifs que vous pouvez faire tourner au doigt ou à la souris." },
+    { q: "En quel matériau ces échantillons sont-ils imprimés ?", a: "Tous les échantillons sont imprimés en bioplastique Eco PLA — le même matériau que les commandes des clients." },
+    { q: "Puis-je commander exactement la même taille ou le même quartier ?", a: "Oui — le configurateur permet de choisir n'importe quelle zone et taille, y compris celles montrées dans la galerie." },
+  ],
+  es: [
+    { q: "¿Son fotos reales o renders 3D?", a: "Ambos: la sección «Impreso en la vida real» muestra fotos reales de artículos terminados, y el resto son modelos 3D interactivos que puedes girar con el dedo o el ratón." },
+    { q: "¿De qué material están impresas estas muestras?", a: "Todas las muestras están impresas en bioplástico Eco PLA — el mismo material que los pedidos de los clientes." },
+    { q: "¿Puedo pedir exactamente el mismo tamaño o distrito?", a: "Sí — el configurador permite elegir cualquier zona y tamaño, incluidos los mostrados en la galería." },
+  ],
+  ro: [
+    { q: "Sunt fotografii reale sau randări 3D?", a: "Ambele: secțiunea „Imprimate în realitate” arată fotografii reale ale produselor finite, iar restul grilei sunt modele 3D interactive pe care le poți roti cu degetul sau mouse-ul." },
+    { q: "Din ce material sunt imprimate mostrele?", a: "Toate mostrele sunt imprimate din bioplastic Eco PLA — același material folosit pentru comenzile clienților." },
+    { q: "Pot comanda exact aceeași mărime sau același cartier?", a: "Da — constructorul îți permite să alegi orice zonă și mărime, inclusiv cele din galerie." },
+  ],
+};
+
+export function proseFaq(page: "create" | "worlds" | "showcase", locale: string): ProseFaqItem[] {
+  const dict = page === "create" ? CREATE_FAQ : page === "worlds" ? WORLDS_FAQ : SHOWCASE_FAQ;
+  return dict[locale] ?? dict.en;
+}

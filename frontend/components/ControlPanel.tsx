@@ -1,0 +1,1335 @@
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+import { useTranslations } from "next-intl";
+import {
+  Building2,
+  CheckCircle2,
+  ChevronDown,
+  Download,
+  Grid,
+  Layers3,
+  Loader2,
+  MapPinned,
+  Mountain,
+  Play,
+  Route,
+  Sparkles,
+} from "lucide-react";
+import { api } from "@/lib/api";
+import { runZoneGeneration } from "@/lib/generation";
+import { useGenerationStore } from "@/store/generation-store";
+import { useShallow } from "zustand/react/shallow";
+import { useAuth } from "@/components/AuthProvider";
+import { gatedDownload } from "@/lib/download";
+
+interface ControlPanelProps {
+  showHexGrid?: boolean;
+  setShowHexGrid?: (show: boolean) => void;
+  selectedZones?: any[];
+  setSelectedZones?: (zones: any[]) => void;
+  gridType?: "hexagonal" | "square" | "circle";
+  setGridType?: (type: "hexagonal" | "square" | "circle") => void;
+  hexSizeM?: number;
+  setHexSizeM?: (size: number) => void;
+  availableCities?: Record<string, any>;
+  selectedCityKey?: string;
+  onCityChange?: (cityKey: string) => void;
+  /** Викликається ПІСЛЯ генерації серії зон з клітинами {row,col,task_id} —
+   *  батьківська сторінка авто-зберігає сітку (продовження панно: куплені клітини
+   *  лишаються золотими при наступному відкритті, без ручного «Зберегти сітку»). */
+  onSeriesGenerated?: (cells: Array<{ row: number; col: number; task_id?: string; zone_id?: string }>) => void;
+}
+
+type AdvancedPanel = "roads" | "buildings" | "terrain" | "preview";
+
+function SectionFrame({
+  eyebrow,
+  title,
+  description,
+  children,
+}: {
+  eyebrow: string;
+  title: string;
+  description: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className="rounded-[28px] border border-[var(--surface-border)] bg-[var(--surface-panel-strong)] p-4 shadow-[0_12px_36px_rgba(15,23,42,0.06)] sm:p-5">
+      <div className="mb-4">
+        <p className="text-[11px] font-semibold uppercase tracking-[0.22em] text-[var(--text-secondary)]">
+          {eyebrow}
+        </p>
+        <h2 className="mt-1 font-title text-xl font-semibold text-[var(--text-primary)]">{title}</h2>
+        <p className="mt-1 text-sm leading-6 text-[var(--text-secondary)]">{description}</p>
+      </div>
+      <div className="space-y-4">{children}</div>
+    </section>
+  );
+}
+
+function InfoPill({
+  label,
+  value,
+  tone = "default",
+}: {
+  label: string;
+  value: string;
+  tone?: "default" | "accent" | "success";
+}) {
+  const toneClasses =
+    tone === "accent"
+      ? "border-teal-200 bg-teal-50 text-teal-800"
+      : tone === "success"
+        ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+        : "border-[var(--surface-border)] bg-white/80 text-[var(--text-primary)]";
+
+  return (
+    <div className={`rounded-[20px] border px-3 py-2 ${toneClasses}`}>
+      <div className="text-[11px] font-semibold uppercase tracking-[0.16em] opacity-70">{label}</div>
+      <div className="mt-1 text-sm font-semibold">{value}</div>
+    </div>
+  );
+}
+
+function SliderField({
+  label,
+  valueLabel,
+  min,
+  max,
+  step,
+  value,
+  onChange,
+  hint,
+}: {
+  label: string;
+  valueLabel: string;
+  min: number;
+  max: number;
+  step: number;
+  value: number;
+  onChange: (value: number) => void;
+  hint?: string;
+}) {
+  return (
+    <div className="rounded-[22px] border border-[var(--surface-border)] bg-white/80 p-3">
+      <div className="flex items-start justify-between gap-3">
+        <label className="text-sm font-medium text-[var(--text-primary)]">{label}</label>
+        <span className="text-sm font-semibold text-[var(--accent-strong)]">{valueLabel}</span>
+      </div>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        aria-label={label}
+        onChange={(e) => onChange(parseFloat(e.target.value))}
+        className="mt-3 w-full"
+      />
+      {hint && <p className="mt-2 text-xs leading-5 text-[var(--text-secondary)]">{hint}</p>}
+    </div>
+  );
+}
+
+function AccordionButton({
+  title,
+  description,
+  icon: Icon,
+  isOpen,
+  onClick,
+  panelId,
+}: {
+  title: string;
+  description: string;
+  icon: typeof Route;
+  isOpen: boolean;
+  onClick: () => void;
+  panelId?: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-expanded={isOpen}
+      aria-controls={panelId}
+      className="flex w-full items-center justify-between gap-3 rounded-[22px] border border-[var(--surface-border)] bg-white/80 px-4 py-3 text-left transition hover:border-[rgba(11,92,87,0.25)] hover:bg-white"
+    >
+      <div className="flex items-start gap-3">
+        <div className="mt-0.5 rounded-2xl bg-[rgba(11,92,87,0.08)] p-2 text-[var(--accent-strong)]">
+          <Icon size={18} />
+        </div>
+        <div>
+          <div className="text-sm font-semibold text-[var(--text-primary)]">{title}</div>
+          <div className="text-xs leading-5 text-[var(--text-secondary)]">{description}</div>
+        </div>
+      </div>
+      <ChevronDown
+        size={18}
+        className={`shrink-0 text-[var(--text-secondary)] transition-transform ${isOpen ? "rotate-180" : ""}`}
+      />
+    </button>
+  );
+}
+
+function CheckboxRow({
+  label,
+  description,
+  checked,
+  onChange,
+}: {
+  label: string;
+  description?: string;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+}) {
+  return (
+    <label className="flex items-start justify-between gap-4 rounded-[20px] border border-[var(--surface-border)] bg-white/80 px-4 py-3">
+      <div>
+        <div className="text-sm font-medium text-[var(--text-primary)]">{label}</div>
+        {description && <div className="mt-1 text-xs leading-5 text-[var(--text-secondary)]">{description}</div>}
+      </div>
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        className="mt-1 h-4 w-4 shrink-0"
+      />
+    </label>
+  );
+}
+
+export function ControlPanel({
+  showHexGrid: externalShowHexGrid,
+  setShowHexGrid: externalSetShowHexGrid,
+  selectedZones: externalSelectedZones,
+  setSelectedZones: externalSetSelectedZones,
+  gridType: externalGridType,
+  setGridType: externalSetGridType,
+  hexSizeM: externalHexSizeM,
+  setHexSizeM: externalSetHexSizeM,
+  availableCities,
+  selectedCityKey,
+  onCityChange,
+  onSeriesGenerated,
+}: ControlPanelProps = {}) {
+  const {
+    selectedArea,
+    isGenerating,
+    taskGroupId,
+    taskIds = [],
+    activeTaskId,
+    taskStatuses = {},
+    showAllZones,
+    progress,
+    status,
+    downloadUrl,
+    printQuality,
+    roadWidthMultiplier,
+    roadHeightMm,
+    roadEmbedMm,
+    buildingMinHeight,
+    buildingHeightMultiplier,
+    buildingFoundationMm,
+    buildingEmbedMm,
+    waterDepth,
+    terrainEnabled,
+    terrainZScale,
+    terrainBaseThicknessMm,
+    terrainResolution,
+    terrariumZoom,
+    exportFormat,
+    modelSizeMm,
+    isAmsMode,
+    flatPlateMode,
+    previewMode,
+    previewIncludeBase,
+    previewIncludeRoads,
+    previewIncludeBuildings,
+    previewIncludeWater,
+    previewIncludeParks,
+    zonePolygonCoords,
+    setRoadWidthMultiplier,
+    setRoadHeightMm,
+    setRoadEmbedMm,
+    setBuildingMinHeight,
+    setBuildingHeightMultiplier,
+    setBuildingFoundationMm,
+    setBuildingEmbedMm,
+    setWaterDepth,
+    setTerrainEnabled,
+    setTerrainZScale,
+    setTerrainBaseThicknessMm,
+    setTerrainResolution,
+    setTerrariumZoom,
+    setExportFormat,
+    setModelSizeMm,
+    setAmsMode,
+    setFlatPlateMode,
+    setPreviewMode,
+    setPreviewIncludeBase,
+    setPreviewIncludeRoads,
+    setPreviewIncludeBuildings,
+    setPreviewIncludeWater,
+    setPreviewIncludeParks,
+    setGenerating,
+    setTaskGroup,
+    setActiveTaskId,
+    setTaskStatuses,
+    setBatchZoneMetaByTaskId,
+    setShowAllZones,
+    updateProgress,
+    setDownloadUrl,
+    setPrintQuality,
+  } = useGenerationStore(useShallow((st) => ({
+    selectedArea: st.selectedArea,
+    isGenerating: st.isGenerating,
+    taskGroupId: st.taskGroupId,
+    taskIds: st.taskIds,
+    activeTaskId: st.activeTaskId,
+    taskStatuses: st.taskStatuses,
+    showAllZones: st.showAllZones,
+    progress: st.progress,
+    status: st.status,
+    downloadUrl: st.downloadUrl,
+    printQuality: st.printQuality,
+    roadWidthMultiplier: st.roadWidthMultiplier,
+    roadHeightMm: st.roadHeightMm,
+    roadEmbedMm: st.roadEmbedMm,
+    buildingMinHeight: st.buildingMinHeight,
+    buildingHeightMultiplier: st.buildingHeightMultiplier,
+    buildingFoundationMm: st.buildingFoundationMm,
+    buildingEmbedMm: st.buildingEmbedMm,
+    waterDepth: st.waterDepth,
+    terrainEnabled: st.terrainEnabled,
+    terrainZScale: st.terrainZScale,
+    terrainBaseThicknessMm: st.terrainBaseThicknessMm,
+    terrainResolution: st.terrainResolution,
+    terrariumZoom: st.terrariumZoom,
+    exportFormat: st.exportFormat,
+    modelSizeMm: st.modelSizeMm,
+    isAmsMode: st.isAmsMode,
+    flatPlateMode: st.flatPlateMode,
+    previewMode: st.previewMode,
+    previewIncludeBase: st.previewIncludeBase,
+    previewIncludeRoads: st.previewIncludeRoads,
+    previewIncludeBuildings: st.previewIncludeBuildings,
+    previewIncludeWater: st.previewIncludeWater,
+    previewIncludeParks: st.previewIncludeParks,
+    zonePolygonCoords: st.zonePolygonCoords,
+    setRoadWidthMultiplier: st.setRoadWidthMultiplier,
+    setRoadHeightMm: st.setRoadHeightMm,
+    setRoadEmbedMm: st.setRoadEmbedMm,
+    setBuildingMinHeight: st.setBuildingMinHeight,
+    setBuildingHeightMultiplier: st.setBuildingHeightMultiplier,
+    setBuildingFoundationMm: st.setBuildingFoundationMm,
+    setBuildingEmbedMm: st.setBuildingEmbedMm,
+    setWaterDepth: st.setWaterDepth,
+    setTerrainEnabled: st.setTerrainEnabled,
+    setTerrainZScale: st.setTerrainZScale,
+    setTerrainBaseThicknessMm: st.setTerrainBaseThicknessMm,
+    setTerrainResolution: st.setTerrainResolution,
+    setTerrariumZoom: st.setTerrariumZoom,
+    setExportFormat: st.setExportFormat,
+    setModelSizeMm: st.setModelSizeMm,
+    setAmsMode: st.setAmsMode,
+    setFlatPlateMode: st.setFlatPlateMode,
+    setPreviewMode: st.setPreviewMode,
+    setPreviewIncludeBase: st.setPreviewIncludeBase,
+    setPreviewIncludeRoads: st.setPreviewIncludeRoads,
+    setPreviewIncludeBuildings: st.setPreviewIncludeBuildings,
+    setPreviewIncludeWater: st.setPreviewIncludeWater,
+    setPreviewIncludeParks: st.setPreviewIncludeParks,
+    setGenerating: st.setGenerating,
+    setTaskGroup: st.setTaskGroup,
+    setActiveTaskId: st.setActiveTaskId,
+    setTaskStatuses: st.setTaskStatuses,
+    setBatchZoneMetaByTaskId: st.setBatchZoneMetaByTaskId,
+    setShowAllZones: st.setShowAllZones,
+    updateProgress: st.updateProgress,
+    setDownloadUrl: st.setDownloadUrl,
+    setPrintQuality: st.setPrintQuality,
+  })));
+
+  const { getIdToken, openLogin } = useAuth();
+  const t = useTranslations("pro");
+  const [error, setError] = useState<string | null>(null);
+  const [internalShowHexGrid, setInternalShowHexGrid] = useState(false);
+  const [internalSelectedZones, setInternalSelectedZones] = useState<any[]>([]);
+  const [internalGridType, setInternalGridType] = useState<"hexagonal" | "square" | "circle">("hexagonal");
+  const [internalHexSizeM, setInternalHexSizeM] = useState(300.0);
+  // Лічильник залишку безкоштовних завантажень (на кнопці «Завантажити STL/3MF»).
+  const [quota, setQuota] = useState<{ remaining: number; limit: number; isAdmin?: boolean } | null>(null);
+  const refreshQuota = async () => {
+    try {
+      const token = await getIdToken().catch(() => null);
+      if (!token) { setQuota(null); return; }
+      const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
+      const r = await fetch(`${API_BASE}/api/account/quota`, { headers: { Authorization: `Bearer ${token}` } });
+      if (!r.ok) { setQuota(null); return; }
+      const j = await r.json();
+      const q = j?.quota;
+      if (q) setQuota({ remaining: Number(q.remaining ?? 0), limit: Number(q.limit ?? 5), isAdmin: Boolean(q.is_admin) });
+    } catch { setQuota(null); }
+  };
+  useEffect(() => { refreshQuota(); /* on mount / after login */ }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  const pollingInFlightRef = useRef(false);
+  const [openPanels, setOpenPanels] = useState<Record<AdvancedPanel, boolean>>({
+    roads: false,
+    buildings: false,
+    terrain: false,
+    preview: false,
+  });
+
+  const showHexGrid = externalShowHexGrid !== undefined ? externalShowHexGrid : internalShowHexGrid;
+  const setShowHexGrid = externalSetShowHexGrid || setInternalShowHexGrid;
+  const selectedZones = externalSelectedZones !== undefined ? externalSelectedZones : internalSelectedZones;
+  const setSelectedZones = externalSetSelectedZones || setInternalSelectedZones;
+  const gridType = externalGridType !== undefined ? externalGridType : internalGridType;
+  const setGridType = externalSetGridType || setInternalGridType;
+  const hexSizeM = externalHexSizeM !== undefined ? externalHexSizeM : internalHexSizeM;
+  const setHexSizeM = externalSetHexSizeM || setInternalHexSizeM;
+
+  useEffect(() => {
+    if (!taskGroupId || !isGenerating) return;
+
+    const interval = setInterval(async () => {
+      if (pollingInFlightRef.current) return;
+      pollingInFlightRef.current = true;
+      try {
+        if (taskIds.length > 1) {
+          const results = await Promise.all(
+            taskIds.map(async (id) => {
+              try {
+                return await api.getStatus(id);
+              } catch {
+                return {
+                  task_id: id,
+                  status: "failed",
+                  progress: 0,
+                  message: "Status fetch failed",
+                  download_url: null,
+                } as any;
+              }
+            }),
+          );
+
+          const tasksList = results as any[];
+          const total = tasksList.length;
+          const completed = tasksList.filter((task) => task.status === "completed").length;
+          const failed = tasksList.filter((task) => task.status === "failed").length;
+
+          const nextStatuses: Record<string, any> = {};
+          for (const task of tasksList) nextStatuses[task.task_id] = task;
+          setTaskStatuses(nextStatuses);
+
+          const avg = tasksList.length
+            ? Math.round(tasksList.reduce((sum, task) => sum + (task.progress || 0), 0) / tasksList.length)
+            : 0;
+          updateProgress(
+            avg,
+            failed
+              ? t("zonesProgressWithErrors", { completed, total, failed })
+              : t("zonesProgress", { completed, total }),
+          );
+
+          const active =
+            (activeTaskId ? nextStatuses[activeTaskId] : null) || (taskIds[0] ? nextStatuses[taskIds[0]] : null);
+          if (active && active.status === "completed") {
+            setDownloadUrl(active.download_url);
+            setPrintQuality(active.print_quality ?? null);
+          }
+
+          if (completed + failed >= total) {
+            setGenerating(false);
+            localStorage.removeItem("3dmap_task_group_id");
+            localStorage.removeItem("3dmap_task_ids");
+            if (failed) {
+              const firstFailed = tasksList.find((task) => task.status === "failed");
+              if (firstFailed) setError(firstFailed.message || t("errorZoneFailed"));
+            }
+          }
+          return;
+        }
+
+        const resp = await api.getStatus(taskGroupId);
+        const single = resp as any;
+        setTaskStatuses({ [single.task_id]: single });
+        updateProgress(single.progress, single.message);
+        if (single.status === "completed") {
+          setGenerating(false);
+          setDownloadUrl(single.download_url);
+          setPrintQuality(single.print_quality ?? null);
+          localStorage.removeItem("3dmap_task_group_id");
+          localStorage.removeItem("3dmap_task_ids");
+        } else if (single.status === "failed" || single.status === "cancelled") {
+          setGenerating(false);
+          localStorage.removeItem("3dmap_task_group_id");
+          localStorage.removeItem("3dmap_task_ids");
+          if (single.status === "failed") setError(single.message);
+        }
+      } catch (pollError) {
+        console.error("Помилка перевірки статусу:", pollError);
+      } finally {
+        pollingInFlightRef.current = false;
+      }
+    }, 2000);
+
+    return () => {
+      clearInterval(interval);
+      pollingInFlightRef.current = false;
+    };
+  }, [taskGroupId, isGenerating, updateProgress, setGenerating, setDownloadUrl, activeTaskId, taskIds, setTaskStatuses]);
+
+  const handleGenerate = async () => {
+    if (!selectedArea) {
+      setError(t("errorSelectArea"));
+      return;
+    }
+
+    setError(null);
+    setGenerating(true);
+
+    try {
+      // ПОВЕРНУТА зона: розширюємо fetch-bbox до AABB повернутого полігона, інакше
+      // кути зони виходять без OSM-даних (порожні клини). Клип лишається по полігону.
+      let fN = selectedArea.getNorth(), fS = selectedArea.getSouth();
+      let fE = selectedArea.getEast(), fW = selectedArea.getWest();
+      if (zonePolygonCoords && zonePolygonCoords.length >= 3) {
+        for (const [lon, lat] of zonePolygonCoords) {
+          fN = Math.max(fN, lat); fS = Math.min(fS, lat);
+          fE = Math.max(fE, lon); fW = Math.min(fW, lon);
+        }
+      }
+      const request = {
+        north: fN,
+        south: fS,
+        east: fE,
+        west: fW,
+        road_width_multiplier: roadWidthMultiplier,
+        road_height_mm: roadHeightMm,
+        road_embed_mm: roadEmbedMm,
+        building_min_height: buildingMinHeight,
+        building_height_multiplier: buildingHeightMultiplier,
+        building_foundation_mm: buildingFoundationMm,
+        building_embed_mm: buildingEmbedMm,
+        water_depth: waterDepth,
+        terrain_enabled: terrainEnabled,
+        terrain_z_scale: terrainZScale,
+        terrain_base_thickness_mm: terrainBaseThicknessMm,
+        terrain_resolution: terrainResolution,
+        terrarium_zoom: terrariumZoom,
+        flatten_buildings_on_terrain: false,
+        flatten_roads_on_terrain: false,
+        export_format: exportFormat,
+        model_size_mm: modelSizeMm,
+        context_padding_m: 400.0,
+        is_ams_mode: isAmsMode && !flatPlateMode,
+        flat_plate_mode: flatPlateMode,
+        preview_mode: previewMode && !flatPlateMode,
+        preview_include_base: previewIncludeBase,
+        preview_include_roads: previewIncludeRoads,
+        preview_include_buildings: previewIncludeBuildings,
+        preview_include_water: previewIncludeWater,
+        preview_include_parks: previewIncludeParks,
+        // Single rotated figure (not grid): crop OSM to the rotated rectangle.
+        ...(zonePolygonCoords && zonePolygonCoords.length >= 3
+          ? { zone_polygon_coords: zonePolygonCoords }
+          : {}),
+      };
+
+      const response = await api.generateModel(request);
+      setTaskGroup(response.task_id, [response.task_id]);
+      setActiveTaskId(response.task_id);
+      // БАГ: якщо перед цим була сітка/серія (showAllZones=true лишався в сторі),
+      // одиночне прев'ю НЕ показувалось — і одиночний, і композитний ефект у
+      // Preview3D гейтяться протилежно, тож жоден не спрацьовував. Скидаємо на
+      // одиночну генерацію.
+      setShowAllZones(false);
+      setBatchZoneMetaByTaskId({});
+    } catch (generateError: any) {
+      console.error("[ERROR] Помилка генерації моделі:", generateError);
+      setError(generateError.message || t("errorGenerate"));
+      setGenerating(false);
+    }
+  };
+
+  // Human-readable labels for QA warning codes from the backend gate.
+  const qaWarningLabel = (code: string): string => {
+    const map: Record<string, string> = {
+      "base:base_not_watertight": t("qaBaseNotWatertight"),
+      "slicer:not_found": t("qaSlicerNotFound"),
+    };
+    if (map[code]) return map[code];
+    if (code.includes("not_watertight")) return t("qaLayerNotWatertight", { layer: code.split(":")[0] });
+    return code;
+  };
+
+  const handleDownload = async () => {
+    if (!downloadUrl) return;
+    const status = activeTaskId ? taskStatuses[activeTaskId] : undefined;
+    const localUrl = status?.download_url_3mf ?? status?.download_url ?? downloadUrl;
+    // Зберігаємо lat/lon/розмір/сценарій разом з моделлю — кабінет пропонує
+    // «Створити знову» з тими самими параметрами (params опційний, бекенд
+    // просто нічого не збереже, якщо не підтримує це поле).
+    const center = selectedArea?.getCenter?.();
+    const scenarioGuess = flatPlateMode ? "flat" : terrainEnabled ? "relief" : "map3d";
+    const params = center
+      ? { lat: center.lat, lon: center.lng, size_mm: modelSizeMm, scenario: scenarioGuess, product: "map" }
+      : undefined;
+    const res = await gatedDownload({
+      taskId: activeTaskId || taskGroupId,
+      downloadUrl: localUrl,
+      meta: { city: selectedCityKey, product_type: "map" },
+      params,
+      getIdToken, openLogin,
+      onLimit: () => window.dispatchEvent(new CustomEvent("monadruk:open-contact", {
+        detail: { message: t("contactLimitMessage") },
+      })),
+    });
+    if (res.status === "error") setError(t("errorDownload"));
+    if (res.quota && typeof res.quota.remaining === "number") {
+      setQuota((q) => ({ remaining: res.quota!.remaining as number, limit: q?.limit ?? 5, isAdmin: q?.isAdmin }));
+    } else if (res.status === "ok") {
+      refreshQuota();
+    }
+  };
+
+  const kyivBounds = {
+    north: 50.6,
+    south: 50.2,
+    east: 30.8,
+    west: 30.2,
+  };
+
+  const handleGenerateZones = async () => {
+    if (selectedZones.length === 0) {
+      setError(t("errorSelectZone"));
+      return;
+    }
+
+    setError(null);
+    setGenerating(true);
+    setShowHexGrid(false);
+
+    try {
+      let requestBounds = kyivBounds;
+      if (availableCities && selectedCityKey && availableCities[selectedCityKey]) {
+        requestBounds = availableCities[selectedCityKey].bounds;
+      }
+
+      const request = {
+        north: requestBounds.north,
+        south: requestBounds.south,
+        east: requestBounds.east,
+        west: requestBounds.west,
+        road_width_multiplier: roadWidthMultiplier,
+        road_height_mm: roadHeightMm,
+        road_embed_mm: roadEmbedMm,
+        building_min_height: buildingMinHeight,
+        building_height_multiplier: buildingHeightMultiplier,
+        building_foundation_mm: buildingFoundationMm,
+        building_embed_mm: buildingEmbedMm,
+        water_depth: waterDepth,
+        terrain_enabled: terrainEnabled,
+        terrain_z_scale: terrainZScale,
+        terrain_base_thickness_mm: terrainBaseThicknessMm,
+        terrain_resolution: terrainResolution,
+        terrarium_zoom: terrariumZoom,
+        terrain_smoothing_sigma: 2.0,
+        terrain_subdivide: false,
+        terrain_subdivide_levels: 1,
+        flatten_buildings_on_terrain: false,
+        flatten_roads_on_terrain: false,
+        export_format: exportFormat,
+        model_size_mm: modelSizeMm,
+        is_ams_mode: isAmsMode && !flatPlateMode,
+        flat_plate_mode: flatPlateMode,
+        preview_mode: previewMode && !flatPlateMode,
+        preview_include_base: previewIncludeBase,
+        preview_include_roads: previewIncludeRoads,
+        preview_include_buildings: previewIncludeBuildings,
+        preview_include_water: previewIncludeWater,
+        preview_include_parks: previewIncludeParks,
+      };
+
+      // СПІЛЬНИЙ хелпер (lib/generation) — той самий код, що й у «Просто»-панелі:
+      // сортує зони, шле батч, віддає ids/meta. Store-побічні-ефекти лишаються тут.
+      const res = await runZoneGeneration({ selectedZones, request, onSeriesGenerated });
+      setTaskGroup(res.taskId, res.taskIds);
+      setActiveTaskId(res.taskIds[0] ?? null);
+      if (res.taskIds.length > 1) setShowAllZones(true);
+      setBatchZoneMetaByTaskId(res.batchMeta);
+    } catch (generateError: any) {
+      setError(generateError.message || t("errorGenerateZones"));
+      setGenerating(false);
+    }
+  };
+
+  const togglePanel = (panel: AdvancedPanel) => {
+    setOpenPanels((current) => ({ ...current, [panel]: !current[panel] }));
+  };
+
+  const cityOptions = availableCities ? Object.keys(availableCities) : [];
+  const selectionReady = showHexGrid ? selectedZones.length > 0 : Boolean(selectedArea);
+  const selectionMode = showHexGrid ? t("modeGridZones") : t("modeSingleArea");
+  const selectionCopy = showHexGrid
+    ? selectedZones.length > 0
+      ? t("selectionZonesReady", { n: selectedZones.length })
+      : t("selectionPickZones")
+    : selectedArea
+      ? t("selectionAreaReady")
+      : t("selectionDrawArea");
+  const primaryActionLabel = showHexGrid
+    ? selectedZones.length > 0
+      ? t("generateZones", { n: selectedZones.length })
+      : t("generateSelectedZones")
+    : t("generateModel");
+  const statusSummary = isGenerating
+    ? status || t("statusGenerating")
+    : downloadUrl
+      ? t("statusReady")
+      : taskGroupId
+        ? t("statusLastRenderSaved")
+        : t("statusNoTasks");
+
+  return (
+    <div className="h-full overflow-y-auto px-4 py-4 sm:px-5">
+      <div className="space-y-4 pb-8">
+        <SectionFrame
+          eyebrow={t("essentialsEyebrow")}
+          title={t("essentialsTitle")}
+          description={t("essentialsDescription")}
+        >
+          <div className="grid gap-3 sm:grid-cols-2">
+            <InfoPill label={t("pillMode")} value={selectionMode} tone="accent" />
+            <InfoPill
+              label={t("pillReadiness")}
+              value={selectionCopy}
+              tone={selectionReady ? "success" : "default"}
+            />
+          </div>
+
+          {cityOptions.length > 0 && onCityChange && selectedCityKey && (
+            <div className="rounded-[24px] border border-[var(--surface-border)] bg-white/80 p-4">
+              <label className="mb-2 flex items-center gap-2 text-sm font-semibold text-[var(--text-primary)]">
+                <MapPinned size={16} className="text-[var(--accent-strong)]" />
+                {t("cityLabel")}
+              </label>
+              <select
+                value={selectedCityKey}
+                onChange={(e) => {
+                  onCityChange(e.target.value);
+                  setError(null);
+                  setSelectedZones([]);
+                }}
+                className="w-full rounded-2xl border border-[var(--surface-border)] bg-[rgba(255,255,255,0.95)] px-4 py-3 text-sm text-[var(--text-primary)] outline-none transition focus:border-[rgba(11,92,87,0.35)]"
+              >
+                {cityOptions.map((city) => (
+                  <option key={city} value={city}>
+                    {city === "Kyiv" ? t("cityKyiv") : city === "Khmelnytskyi" ? t("cityKhmelnytskyi") : city}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          <div className="grid gap-3 sm:grid-cols-2" role="group" aria-label={t("modeGroupLabel")}>
+            <button
+              type="button"
+              aria-pressed={!showHexGrid}
+              onClick={() => {
+                setShowHexGrid(false);
+                setSelectedZones([]);
+                setError(null);
+              }}
+              className={`rounded-[22px] border px-4 py-4 text-left transition ${
+                !showHexGrid
+                  ? "border-[rgba(11,92,87,0.28)] bg-[rgba(15,118,110,0.08)] shadow-[0_16px_32px_rgba(11,92,87,0.12)]"
+                  : "border-[var(--surface-border)] bg-white/80"
+              }`}
+            >
+              <div className="flex items-center gap-2 text-sm font-semibold text-[var(--text-primary)]">
+                <MapPinned size={16} className="text-[var(--accent-strong)]" />
+                {t("cardSingleTitle")}
+              </div>
+              <p className="mt-2 text-xs leading-5 text-[var(--text-secondary)]">
+                {t("cardSingleDesc")}
+              </p>
+            </button>
+
+            <button
+              type="button"
+              aria-pressed={showHexGrid}
+              onClick={() => {
+                setShowHexGrid(true);
+                setError(null);
+              }}
+              className={`rounded-[22px] border px-4 py-4 text-left transition ${
+                showHexGrid
+                  ? "border-[rgba(11,92,87,0.28)] bg-[rgba(15,118,110,0.08)] shadow-[0_16px_32px_rgba(11,92,87,0.12)]"
+                  : "border-[var(--surface-border)] bg-white/80"
+              }`}
+            >
+              <div className="flex items-center gap-2 text-sm font-semibold text-[var(--text-primary)]">
+                <Grid size={16} className="text-[var(--accent-strong)]" />
+                {t("cardSeriesTitle")}
+              </div>
+              <p className="mt-2 text-xs leading-5 text-[var(--text-secondary)]">
+                {t("cardSeriesDesc")}
+              </p>
+            </button>
+          </div>
+
+          {showHexGrid && (
+            <div className="rounded-[24px] border border-[rgba(15,118,110,0.15)] bg-[rgba(15,118,110,0.05)] p-4">
+              <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-[var(--text-primary)]">
+                <Grid size={16} className="text-[var(--accent-strong)]" />
+                {t("gridParams")}
+              </div>
+
+              <div className="grid gap-3">
+                <div>
+                  <label className="mb-2 block text-sm font-medium text-[var(--text-primary)]">{t("gridType")}</label>
+                  <select
+                    value={gridType}
+                    onChange={(e) => {
+                      const newType = e.target.value as "hexagonal" | "square" | "circle";
+                      setGridType(newType);
+                      setSelectedZones([]);
+                    }}
+                    className="w-full rounded-2xl border border-[var(--surface-border)] bg-white px-4 py-3 text-sm text-[var(--text-primary)] outline-none transition focus:border-[rgba(11,92,87,0.35)]"
+                  >
+                    <option value="hexagonal">{t("gridHexagonal")}</option>
+                    <option value="square">{t("gridSquare")}</option>
+                    <option value="circle">{t("gridCircle")}</option>
+                  </select>
+                </div>
+
+                <SliderField
+                  label={gridType === "circle" ? t("circleDiameter") : t("cellSizeLabel")}
+                  valueLabel={t("meters", { m: hexSizeM.toFixed(0) })}
+                  min={200}
+                  max={2000}
+                  step={100}
+                  value={hexSizeM}
+                  onChange={(value) => {
+                    setHexSizeM(value);
+                    setSelectedZones([]);
+                  }}
+                  hint={t("cellSizeHint")}
+                />
+
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <InfoPill label={t("zonesSelected")} value={String(selectedZones.length)} tone={selectedZones.length > 0 ? "success" : "default"} />
+                  <InfoPill
+                    label={t("selectionState")}
+                    value={selectedZones.length > 0 ? t("readyToRun") : t("pickZonesOnMap")}
+                    tone={selectedZones.length > 0 ? "success" : "default"}
+                  />
+                </div>
+              </div>
+            </div>
+          )}
+
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div className="rounded-[24px] border border-[var(--surface-border)] bg-white/80 p-4">
+              <label className="mb-2 flex items-center gap-2 text-sm font-semibold text-[var(--text-primary)]">
+                <Sparkles size={16} className="text-[var(--accent-strong)]" />
+                {t("exportFormat")}
+              </label>
+              <select
+                value={exportFormat}
+                onChange={(e) => setExportFormat(e.target.value as "stl" | "3mf")}
+                className="w-full rounded-2xl border border-[var(--surface-border)] bg-white px-4 py-3 text-sm text-[var(--text-primary)] outline-none transition focus:border-[rgba(11,92,87,0.35)]"
+              >
+                <option value="3mf">{t("formatRecommended")}</option>
+                <option value="stl">STL</option>
+              </select>
+            </div>
+
+            <SliderField
+              label={t("modelSize")}
+              valueLabel={t("millimeters", { mm: modelSizeMm.toFixed(0) })}
+              min={50}
+              max={500}
+              step={10}
+              value={modelSizeMm}
+              onChange={setModelSizeMm}
+              hint={t("modelSizeHint", { cm: (modelSizeMm / 10).toFixed(1) })}
+            />
+          </div>
+
+          <div className="rounded-[24px] border border-[rgba(11,92,87,0.18)] bg-[rgba(11,92,87,0.06)] p-4">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <div className="text-sm font-semibold text-[var(--text-primary)]">{t("mainAction")}</div>
+                <div className="mt-1 text-xs leading-5 text-[var(--text-secondary)]">
+                  {showHexGrid ? t("mainActionGridHint") : t("mainActionSingleHint")}
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-2 sm:items-end">
+                {/* Preview / Full mode toggle — show prominently above Generate */}
+                <div className="flex items-center gap-1 rounded-full border border-[var(--surface-border)] bg-white/80 p-1 text-xs" role="group" aria-label={t("renderModeGroupLabel")}>
+                  <button
+                    type="button"
+                    onClick={() => setPreviewMode(true)}
+                    disabled={isGenerating}
+                    aria-pressed={previewMode}
+                    className={`rounded-full px-3 py-1.5 font-semibold transition ${
+                      previewMode
+                        ? "bg-[var(--accent-strong)] text-white shadow"
+                        : "text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                    } disabled:cursor-not-allowed disabled:opacity-50`}
+                    title={t("previewModeTitle")}
+                  >
+                    {t("previewModeLabel")}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setPreviewMode(false)}
+                    disabled={isGenerating}
+                    aria-pressed={!previewMode}
+                    className={`rounded-full px-3 py-1.5 font-semibold transition ${
+                      !previewMode
+                        ? "bg-[var(--accent-strong)] text-white shadow"
+                        : "text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                    } disabled:cursor-not-allowed disabled:opacity-50`}
+                    title={t("fullModeTitle")}
+                  >
+                    {t("fullModeLabel")}
+                  </button>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={showHexGrid ? handleGenerateZones : handleGenerate}
+                  disabled={!selectionReady || isGenerating}
+                  className="inline-flex min-h-12 items-center justify-center gap-2 rounded-full bg-[var(--accent-strong)] px-5 py-3 text-sm font-semibold text-white shadow-[0_16px_32px_rgba(11,92,87,0.24)] transition hover:bg-[var(--accent)] disabled:cursor-not-allowed disabled:bg-slate-400"
+                >
+                  {isGenerating ? (
+                    <>
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      {t("generating")}
+                    </>
+                  ) : (
+                    <>
+                      <Play className="h-4 w-4" />
+                      {primaryActionLabel}
+                      {previewMode && <span className="ml-1 rounded-full bg-white/20 px-2 py-0.5 text-[10px]">{t("previewBadge")}</span>}
+                    </>
+                  )}
+                </button>
+
+                {showHexGrid && selectedZones.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setSelectedZones([])}
+                    className="rounded-full px-4 py-2 text-xs font-semibold text-[var(--text-secondary)] transition hover:bg-black/5"
+                  >
+                    {t("clearSelection")}
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        </SectionFrame>
+
+        <SectionFrame
+          eyebrow={t("outputEyebrow")}
+          title={t("outputTitle")}
+          description={t("outputDescription")}
+        >
+          <div className="grid gap-3 sm:grid-cols-2">
+            <InfoPill label={t("pillRenderState")} value={statusSummary} tone={downloadUrl ? "success" : "default"} />
+            <InfoPill
+              label={t("pillActiveTask")}
+              value={activeTaskId ? activeTaskId.slice(0, 12) : t("taskNotCreated")}
+              tone={activeTaskId ? "accent" : "default"}
+            />
+          </div>
+
+          {/* Завжди-змонтований polite live-region: озвучує статус генерації/готовності
+              незрячим (сам прогрес-блок нижче умовний → не озвучився б). */}
+          <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+            {statusSummary}
+          </div>
+
+          {isGenerating && (
+            <div className="rounded-[24px] border border-[rgba(11,92,87,0.15)] bg-[rgba(11,92,87,0.06)] p-4">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2 text-sm font-semibold text-[var(--text-primary)]">
+                  <Loader2 className="h-4 w-4 animate-spin text-[var(--accent-strong)]" />
+                  {status || t("processing")}
+                </div>
+                <span className="text-sm font-semibold text-[var(--accent-strong)]">{progress}%</span>
+              </div>
+              <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/80">
+                <div
+                  className="h-full rounded-full bg-[var(--accent-strong)] transition-all"
+                  style={{ width: `${progress}%` }}
+                />
+              </div>
+            </div>
+          )}
+
+          {taskIds.length > 1 && (
+            <div className="rounded-[24px] border border-[var(--surface-border)] bg-white/80 p-4">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <div className="text-sm font-semibold text-[var(--text-primary)]">{t("generatedZones")}</div>
+                  <div className="mt-1 text-xs leading-5 text-[var(--text-secondary)]">
+                    {t("generatedZonesDesc")}
+                  </div>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    const next = !showAllZones;
+                    setShowAllZones(next);
+                    setError(null);
+                    setDownloadUrl(null);
+                  }}
+                  className={`rounded-full px-4 py-2 text-xs font-semibold ${
+                    showAllZones
+                      ? "bg-[rgba(11,92,87,0.12)] text-[var(--accent-strong)]"
+                      : "bg-slate-900 text-white"
+                  }`}
+                >
+                  {showAllZones ? t("showOneZone") : t("showAllZones")}
+                </button>
+              </div>
+
+              <div className="mt-4 max-h-52 space-y-2 overflow-auto pr-1">
+                {taskIds.map((id, idx) => (
+                  <button
+                    key={id}
+                    type="button"
+                    onClick={async () => {
+                      if (showAllZones) return;
+                      setActiveTaskId(id);
+                      setError(null);
+
+                      const taskState = taskStatuses[id];
+                      if (taskState && taskState.status === "completed" && taskState.download_url) {
+                        setDownloadUrl(taskState.download_url);
+                        return;
+                      }
+
+                      setDownloadUrl(null);
+                      try {
+                        const resp = await api.getStatus(id);
+                        const single = resp as any;
+                        if (single && single.status === "completed" && single.download_url) {
+                          setDownloadUrl(single.download_url);
+                        }
+                      } catch {
+                        // ignore single fetch issues
+                      }
+                    }}
+                    className={`w-full rounded-[18px] border px-3 py-3 text-left transition ${
+                      id === activeTaskId
+                        ? "border-[rgba(11,92,87,0.22)] bg-[rgba(11,92,87,0.08)]"
+                        : "border-[var(--surface-border)] bg-white hover:bg-[rgba(15,23,42,0.03)]"
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="flex items-center gap-2 text-sm font-semibold text-[var(--text-primary)]">
+                        <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-[rgba(11,92,87,0.12)] text-[11px] font-bold text-[var(--accent-strong)]">
+                          {idx + 1}
+                        </span>
+                        {t("zoneNumber", { n: idx + 1 })}
+                      </span>
+                      {id === activeTaskId && <CheckCircle2 className="h-4 w-4 text-[var(--accent-strong)]" />}
+                    </div>
+                    <div className="mt-1 text-xs text-[var(--text-secondary)]">
+                      {taskStatuses[id]?.status || t("awaitingStatus")}
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {downloadUrl && printQuality && printQuality.status === "ok" && (
+            <div className="rounded-[18px] border border-emerald-200 bg-emerald-50 px-4 py-2.5 text-xs font-medium text-emerald-800">
+              {t("printCheckPassed")}
+            </div>
+          )}
+          {downloadUrl && printQuality && printQuality.status !== "ok" && (printQuality.warnings?.length ?? 0) > 0 && (
+            <div className="rounded-[18px] border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-900">
+              <p className="font-semibold">{t("printWarningsTitle")}</p>
+              <ul className="mt-1 list-disc space-y-0.5 pl-4">
+                {printQuality.warnings!.map((w, i) => (
+                  <li key={i}>{qaWarningLabel(w)}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {downloadUrl && (
+            <button
+              type="button"
+              onClick={handleDownload}
+              className="inline-flex min-h-12 w-full items-center justify-center gap-2 rounded-full bg-emerald-600 px-5 py-3 text-sm font-semibold text-white shadow-[0_16px_30px_rgba(5,150,105,0.22)] transition hover:bg-emerald-500"
+            >
+              <Download className="h-4 w-4" />
+              {`${t("downloadModel")}${
+                quota == null
+                  ? ""
+                  : quota.isAdmin
+                    ? ` · ${t("dlUnlimited")}`
+                    : ` · ${t("dlCount", { n: Math.max(0, quota.remaining) })}`
+              }`}
+            </button>
+          )}
+          {downloadUrl && quota && !quota.isAdmin && quota.remaining <= 0 && (
+            <p className="-mt-1 text-center text-[12px] font-medium text-amber-700">{t("dlExhausted")}</p>
+          )}
+
+          {error && (
+            <div role="alert" className="rounded-[22px] border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+              {error}
+            </div>
+          )}
+        </SectionFrame>
+
+        <SectionFrame
+          eyebrow={t("advancedEyebrow")}
+          title={t("advancedTitle")}
+          description={t("advancedDescription")}
+        >
+          <AccordionButton
+            title={t("roadsTitle")}
+            description={t("roadsDesc")}
+            icon={Route}
+            isOpen={openPanels.roads}
+            onClick={() => togglePanel("roads")}
+            panelId="cp-panel-roads"
+          />
+          {openPanels.roads && (
+            <div className="space-y-3" id="cp-panel-roads" role="region" aria-label={t("roadsTitle")}>
+              <SliderField
+                label={t("roadWidth")}
+                valueLabel={roadWidthMultiplier.toFixed(1)}
+                min={0.3}
+                max={2}
+                step={0.1}
+                value={roadWidthMultiplier}
+                onChange={setRoadWidthMultiplier}
+              />
+              <SliderField
+                label={t("roadHeight")}
+                valueLabel={t("millimeters", { mm: roadHeightMm.toFixed(1) })}
+                min={0.2}
+                max={3}
+                step={0.1}
+                value={roadHeightMm}
+                onChange={setRoadHeightMm}
+              />
+              <SliderField
+                label={t("roadEmbed")}
+                valueLabel={t("millimeters", { mm: roadEmbedMm.toFixed(1) })}
+                min={0}
+                max={1}
+                step={0.1}
+                value={roadEmbedMm}
+                onChange={setRoadEmbedMm}
+                hint={t("roadEmbedHint")}
+              />
+            </div>
+          )}
+
+          <AccordionButton
+            title={t("buildingsTitle")}
+            description={t("buildingsDesc")}
+            icon={Building2}
+            isOpen={openPanels.buildings}
+            onClick={() => togglePanel("buildings")}
+            panelId="cp-panel-buildings"
+          />
+          {openPanels.buildings && (
+            <div className="space-y-3" id="cp-panel-buildings" role="region" aria-label={t("buildingsTitle")}>
+              <SliderField
+                label={t("buildingMinHeight")}
+                valueLabel={t("metersFloat", { m: buildingMinHeight.toFixed(1) })}
+                min={1}
+                max={10}
+                step={0.5}
+                value={buildingMinHeight}
+                onChange={setBuildingMinHeight}
+              />
+              <SliderField
+                label={t("buildingHeightMultiplier")}
+                valueLabel={buildingHeightMultiplier.toFixed(1)}
+                min={0.5}
+                max={3}
+                step={0.1}
+                value={buildingHeightMultiplier}
+                onChange={setBuildingHeightMultiplier}
+              />
+              <SliderField
+                label={t("buildingFoundation")}
+                valueLabel={t("millimeters", { mm: buildingFoundationMm.toFixed(1) })}
+                min={0.1}
+                max={3}
+                step={0.1}
+                value={buildingFoundationMm}
+                onChange={setBuildingFoundationMm}
+              />
+              <SliderField
+                label={t("buildingEmbed")}
+                valueLabel={t("millimeters", { mm: buildingEmbedMm.toFixed(1) })}
+                min={0}
+                max={1}
+                step={0.1}
+                value={buildingEmbedMm}
+                onChange={setBuildingEmbedMm}
+                hint={t("buildingEmbedHint")}
+              />
+            </div>
+          )}
+
+          <AccordionButton
+            title={t("terrainTitle")}
+            description={t("terrainDesc")}
+            icon={Mountain}
+            isOpen={openPanels.terrain}
+            onClick={() => togglePanel("terrain")}
+            panelId="cp-panel-terrain"
+          />
+          {openPanels.terrain && (
+            <div className="space-y-3" id="cp-panel-terrain" role="region" aria-label={t("terrainTitle")}>
+              <SliderField
+                label={t("waterDepth")}
+                valueLabel={t("millimeters", { mm: waterDepth.toFixed(1) })}
+                min={0.5}
+                max={5}
+                step={0.5}
+                value={waterDepth}
+                onChange={setWaterDepth}
+              />
+
+              <CheckboxRow
+                label={t("flatPlate")}
+                description={t("flatPlateDesc")}
+                checked={flatPlateMode}
+                onChange={setFlatPlateMode}
+              />
+
+              <CheckboxRow
+                label={t("amsFlatMode")}
+                description={t("amsFlatModeDesc")}
+                checked={isAmsMode && !flatPlateMode}
+                onChange={setAmsMode}
+              />
+
+              {!isAmsMode && !flatPlateMode && (
+                <>
+                  <CheckboxRow
+                    label={t("enableTerrain")}
+                    description={t("enableTerrainDesc")}
+                    checked={terrainEnabled}
+                    onChange={setTerrainEnabled}
+                  />
+
+                  {terrainEnabled && (
+                    <div className="space-y-3">
+                      <SliderField
+                        label={t("terrainZScale")}
+                        valueLabel={terrainZScale.toFixed(1)}
+                        min={0.5}
+                        max={3}
+                        step={0.1}
+                        value={terrainZScale}
+                        onChange={setTerrainZScale}
+                      />
+                      <SliderField
+                        label={t("meshDetail")}
+                        valueLabel={`${terrainResolution}×${terrainResolution}`}
+                        min={120}
+                        max={320}
+                        step={20}
+                        value={terrainResolution}
+                        onChange={(value) => setTerrainResolution(parseInt(String(value), 10))}
+                        hint={t("meshDetailHint")}
+                      />
+                      <SliderField
+                        label={t("terrariumZoom")}
+                        valueLabel={String(terrariumZoom)}
+                        min={11}
+                        max={16}
+                        step={1}
+                        value={terrariumZoom}
+                        onChange={(value) => setTerrariumZoom(parseInt(String(value), 10))}
+                        hint={t("terrariumZoomHint")}
+                      />
+                      <SliderField
+                        label={t("terrainBaseThickness")}
+                        valueLabel={t("millimeters", { mm: terrainBaseThicknessMm.toFixed(1) })}
+                        min={0.2}
+                        max={20}
+                        step={0.1}
+                        value={terrainBaseThicknessMm}
+                        onChange={setTerrainBaseThicknessMm}
+                        hint={t("terrainBaseThicknessHint")}
+                      />
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+
+          <AccordionButton
+            title={t("previewComponentsTitle")}
+            description={t("previewComponentsDesc")}
+            icon={Layers3}
+            isOpen={openPanels.preview}
+            onClick={() => togglePanel("preview")}
+            panelId="cp-panel-preview"
+          />
+          {openPanels.preview && (
+            <div className="space-y-3" id="cp-panel-preview" role="region" aria-label={t("previewComponentsTitle")}>
+              <CheckboxRow
+                label={t("previewTerrain")}
+                description={t("previewTerrainDesc")}
+                checked={previewIncludeBase}
+                onChange={setPreviewIncludeBase}
+              />
+              <CheckboxRow
+                label={t("previewRoads")}
+                description={t("previewRoadsDesc")}
+                checked={previewIncludeRoads}
+                onChange={setPreviewIncludeRoads}
+              />
+              <CheckboxRow
+                label={t("previewBuildings")}
+                description={t("previewBuildingsDesc")}
+                checked={previewIncludeBuildings}
+                onChange={setPreviewIncludeBuildings}
+              />
+              <CheckboxRow
+                label={t("previewWater")}
+                description={t("previewWaterDesc")}
+                checked={previewIncludeWater}
+                onChange={setPreviewIncludeWater}
+              />
+              <CheckboxRow
+                label={t("previewParks")}
+                description={t("previewParksDesc")}
+                checked={previewIncludeParks}
+                onChange={setPreviewIncludeParks}
+              />
+              <div className="rounded-[20px] border border-[rgba(15,118,110,0.12)] bg-[rgba(15,118,110,0.05)] px-4 py-3 text-xs leading-5 text-[var(--text-secondary)]">
+                {t("previewVisibilityNote")}
+              </div>
+            </div>
+          )}
+        </SectionFrame>
+      </div>
+    </div>
+  );
+}

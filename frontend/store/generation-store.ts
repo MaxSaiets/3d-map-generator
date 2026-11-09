@@ -1,0 +1,516 @@
+import { create } from "zustand";
+import { LatLngBounds } from "leaflet";
+
+import type { TaskStatus } from "@/lib/api";
+
+interface GenerationState {
+  selectedArea: LatLngBounds | null;
+  isGenerating: boolean;
+  // Для single: taskGroupId === activeTaskId
+  // Для batch: taskGroupId === "batch_<uuid>", activeTaskId === один з taskIds
+  taskGroupId: string | null;
+  taskIds: string[];
+  activeTaskId: string | null;
+  progress: number;
+  status: string;
+  etaS: number | null;
+  elapsedS: number | null;
+  /** C-series (2026-09-03): хід створення моделі — чергa, помилка з причиною,
+   *  підготовка друк-файлу і ознака відновленої з localStorage задачі. */
+  queued: boolean;
+  /** Бекенд не відповідає, але ми ще чекаємо (рестарт/перевантаження). */
+  reconnecting: boolean;
+  /** Скільки ще секунд стояти В ЧЕРЗІ (не тривалість самої генерації). */
+  queueEta: number | null;
+  /** 16.09.2026: джерело карт (OpenStreetMap) лягло, бекенд ЧЕКАЄ на нього —
+   *  за скільки секунд наступна спроба. null — не чекаємо. */
+  sourceWaitS: number | null;
+  genError: string | null;
+  printPrep: number | null;
+  /** Іде завантаження друк-файлу (клік «Завантажити» → друга генерація 1–3 хв).
+   *  ⭐08.09.2026: без цього прапорця guided-кнопка лишалась активною й КОЖЕН клік
+   *  запускав НОВУ повну генерацію — реальний випадок із проду: 31 клік за 5 хв
+   *  → 35 генерацій на 2-ядерній VM. Тримаємо в сторі, бо кнопка живе в
+   *  ScenarioFlow, а завантаження виконує SimpleControlPanel. */
+  downloadBusy: boolean;
+  taskRestored: boolean;
+  /** D-3: guided-режим активний → прогрес живе в панелі, сцена його не дублює. */
+  guidedMode: boolean;
+  /** H-4: тап по CTA, поки карта ще не віддала рамку. Виконається, щойн рамка є. */
+  pendingGenerate: boolean;
+  /** Nightly cache warming: id шаблону з ?template=<id>, доки користувач нічого не чіпав.
+   *  Йде в /api/generate template_id, щоб нічний прогрів кешував саме ці прев'ю. Скидається
+   *  в null щойно користувач торкнувся параметрів (touchedRef) або обрав інший сценарій. */
+  templateId: string | null;
+  downloadUrl: string | null;
+  printQuality: TaskStatus["print_quality"] | null;
+  taskStatuses: Record<string, TaskStatus>;
+  showAllZones: boolean;
+  // Batch preview: mapping taskId -> zone meta (so we can place tiles like on the map)
+  batchZoneMetaByTaskId: Record<string, { zoneId: string; row?: number; col?: number }>;
+
+  // Параметри генерації
+  roadWidthMultiplier: number;
+  roadHeightMm: number;
+  roadEmbedMm: number;
+  buildingMinHeight: number;
+  buildingHeightMultiplier: number;
+  buildingFoundationMm: number;
+  buildingEmbedMm: number;
+  waterDepth: number;
+  terrainEnabled: boolean;
+  terrainZScale: number;
+  terrainBaseThicknessMm: number;
+  terrainResolution: number;
+  terrariumZoom: number;
+  exportFormat: "stl" | "3mf";
+  modelSizeMm: number; // Розмір моделі в міліметрах
+
+  // Single-figure rotation (NOT grid mode): rotated rectangle corners [lon,lat]
+  // sent to the backend as zone_polygon_coords so OSM is cropped to the figure.
+  zonePolygonCoords: Array<[number, number]> | null;
+  cropRotationDeg: number;
+  // Форма одиночної мапи (прямокутник/коло/шестикутник/серце…) — спільна для
+  // guided-флоу і повного конструктора (раніше жила в useState сторінки й guided
+  // її не бачив: «не все можна вибрати», 24.09.2026). Рамка карти ріже по ній полігон.
+  figureShape: string;
+  roundCorners: boolean;
+
+  // D4 GPX: bbox+точки завантаженого треку. Overlay карти центрує зону на
+  // треку і малює полілінію; зберігається в store (не event), бо overlay
+  // перебудовується при зміні розміру моделі і має знов застосувати фокус.
+  gpxFocus: { west: number; south: number; east: number; north: number; points: Array<[number, number]> } | null;
+
+  // Стан простої панелі /create — У STORE, НЕ в useState! Панель змонтована
+  // ДВІЧІ (desktop sidebar + mobile таб): локальний стан розсинхронізовувався
+  // між копіями → вибране «Панно 3×3»/GPX/магніт губилось при генерації з
+  // іншої копії (юзер: «панно згенерувало не те»).
+  simplePanelMode: 0 | 2 | 3;
+  simpleMagnetMode: boolean;
+  simpleMapLabel: string;
+  // Автопідказка напису (назва обраного міста). НЕ надсилається сама по собі —
+  // лише підставляється у поле, коли користувач вмикає напис/магніт (18.09.2026:
+  // раніше назва міста потрапляла в map_label КОЖНОЇ мапи без відома юзера).
+  suggestedMapLabel: string;
+  // styleId + активний шаблон теж спільні (панель монтується двічі) — інакше
+  // вибраний стиль/шаблон розсинхронізується між desktop/mobile копіями і при
+  // ресайзі або генерації з іншої копії застосовувався б старий стиль.
+  simpleStyleId: string;
+  simpleTemplate: string | null;
+  // ЄДИНЕ ДЖЕРЕЛО ПРАВДИ для взаємовиключного базового ФОРМАТУ моделі у Просто-флоу
+  // (/create). Сегмент-контрол вибирає рівно один із: «Об'ємна 3D» / «Плоска
+  // кольорова» / «Магніт» / «Панно». setSimpleFormat похідно синхронізує усі
+  // ЛЕГАСІ-булеві (simpleRelief/simpleFlatAms/simpleMagnetMode/simplePanelMode) як
+  // ДЗЕРКАЛА, щоб buildSingleMapReq/applyStyle/fetchQuote/e2e лишились без змін.
+  simpleFormat: "relief3d" | "flat" | "magnet" | "panno";
+  // Кольорова тема/палітра (#2): classic | sepia | noir | ocean | neon. Спільна (панель ×2).
+  simpleColorPalette: string;
+  // «Плоска кольорова (AMS)» — пласка багатокольорова плитка-карта (кожен шар
+  // окремий колір-філамент), міцна основа 3мм. Стан спільний (панель ×2).
+  simpleFlatAms: boolean;
+  // З'ЄДНУВАЧ-ПАЗИ (метелик): «ластівчин-хвіст» пази на гранях + деталь-ключ,
+  // щоб стикувати дві плоскі карти. Стан спільний (панель монтується двічі).
+  simpleConnector: boolean;
+  // З'ЄДНУВАЧІ для СЕРІЇ (панно): замки на спільних гранях сусідніх плиток, ON за
+  // замовчуванням (друковані шматки стикуються). Окремо від single-tile simpleConnector.
+  simpleSeriesConnectors: boolean;
+  // ПРЕМІУМ-РАМКА: компас + масштабна лінійка + координати поверх плоскої карти.
+  simpleFrame: boolean;
+  // СТИЛЬ РАМКИ: classic | ornate | compass (дзеркалить backend frame_style). Спільна (панель ×2).
+  simpleFrameStyle: string;
+  // РЕЛЬЄФ (висоти землі): окремий перемикач для УСІХ режимів карт. Джерело правди
+  // для terrain_enabled у Просто-флоу (стиль лише задає дефолт). Вмикається лише на
+  // 3D-карті (повний пайплайн); плоскі режими (AMS/магніт/конектор/рамка) — без рельєфу.
+  simpleRelief: boolean;
+  // ПЛАСКІ БУДИНКИ: у плоских режимах будинки = тонкі footprint-плити одної висоти
+  // (чистіший AMS-друк) замість лог-масштабованих блоків. Opt-in.
+  simpleFlatBuildings: boolean;
+  // ВИДІЛЕНІ БУДІВЛІ: користувач клікає свої будинки (дім/робота/орієнтири) на карті
+  // → highlightPoints [[lon,lat],...] → КОЖЕН окрема ЧЕРВОНА вставна деталь. Плоский режим.
+  mapHighlightBuilding: boolean;
+  highlightPoints: Array<[number, number]>;
+  // Контури обраних будівель (паралельно highlightPoints, той самий індекс) — щоб
+  // підсвітити на карті РЕАЛЬНИЙ контур будинку, а не лише крапку. null = ще не завантажено.
+  highlightFootprints: Array<Array<[number, number]> | null>;
+  gpxName: string | null;
+  gpxNote: string | null;
+
+  // СІТКА СЕРІЇ (гекси/квадрати/кола) — У STORE, НЕ в useState! Той самий клас
+  // багу, що й simplePanelMode: панель /create монтується ДВІЧІ (desktop+mobile),
+  // page-level useState розсинхронізовувався між копіями. Тепер сітка доступна
+  // і в «Просто», і в «Профі» (спільне джерело правди).
+  selectedZones: any[];
+  showHexGrid: boolean;
+  gridType: "hexagonal" | "square" | "circle";
+  hexSizeM: number;
+  /** Поворот сітки серії (°) — обертає клітини довкола центру сітки. */
+  gridRotationDeg: number;
+
+  // Preview only
+  // Preview only
+  terrainSmoothShading: boolean;
+
+  // AMS Mode
+  isAmsMode: boolean;
+  flatPlateMode: boolean;
+
+  // Fast Preview Mode (~30s vs full 5-15min)
+  previewMode: boolean;
+
+  // Preview visibility controls
+  previewIncludeBase: boolean;
+  previewIncludeRoads: boolean;
+  previewIncludeBuildings: boolean;
+  previewIncludeWater: boolean;
+  previewIncludeParks: boolean;
+
+  // Actions
+  setSelectedArea: (area: LatLngBounds | null) => void;
+  setZonePolygonCoords: (coords: Array<[number, number]> | null) => void;
+  setGpxFocus: (focus: GenerationState["gpxFocus"]) => void;
+  setSimplePanelMode: (mode: 0 | 2 | 3) => void;
+  setSimpleMagnetMode: (on: boolean) => void;
+  setSimpleMapLabel: (label: string) => void;
+  setSuggestedMapLabel: (label: string) => void;
+  setSimpleStyleId: (id: string) => void;
+  setSimpleTemplate: (id: string | null) => void;
+  setSimpleFormat: (f: GenerationState["simpleFormat"]) => void;
+  setSimpleColorPalette: (p: string) => void;
+  setSimpleFlatAms: (on: boolean) => void;
+  setSimpleConnector: (on: boolean) => void;
+  setSimpleSeriesConnectors: (on: boolean) => void;
+  setSimpleFrame: (on: boolean) => void;
+  setSimpleFrameStyle: (style: string) => void;
+  setSimpleRelief: (on: boolean) => void;
+  setSimpleFlatBuildings: (on: boolean) => void;
+  setMapHighlightBuilding: (on: boolean) => void;
+  clearHighlights: () => void;
+  addHighlightPoint: (pt: [number, number]) => void;
+  removeHighlightAt: (index: number) => void;
+  setHighlightFootprint: (pt: [number, number], poly: Array<[number, number]>) => void;
+  setGpxName: (name: string | null) => void;
+  setGpxNote: (note: string | null) => void;
+  setSelectedZones: (zones: any[]) => void;
+  setShowHexGrid: (on: boolean) => void;
+  setGridType: (gt: "hexagonal" | "square" | "circle") => void;
+  setHexSizeM: (m: number) => void;
+  setGridRotationDeg: (d: number) => void;
+  setCropRotationDeg: (deg: number) => void;
+  setFigureShape: (shape: string) => void;
+  setRoundCorners: (on: boolean) => void;
+  setGenerating: (isGenerating: boolean) => void;
+  setTaskGroup: (groupId: string | null, taskIds?: string[], productType?: "map" | "keychain") => void;
+  setActiveTaskId: (taskId: string | null) => void;
+  setTaskStatuses: (statuses: Record<string, TaskStatus>) => void;
+  setShowAllZones: (value: boolean) => void;
+  setBatchZoneMetaByTaskId: (value: Record<string, { zoneId: string; row?: number; col?: number }>) => void;
+  updateProgress: (progress: number, status: string) => void;
+  /** perf-2026-09-03: чесний ETA з бекенду (медіана реальних прогонів) + скільки вже минуло. */
+  setEta: (etaS: number | null, elapsedS: number | null) => void;
+  setQueued: (queued: boolean, queueEta?: number | null) => void;
+  setSourceWait: (s: number | null) => void;
+  setReconnecting: (v: boolean) => void;
+  setGenError: (genError: string | null) => void;
+  setPrintPrep: (printPrep: number | null) => void;
+  setDownloadBusy: (downloadBusy: boolean) => void;
+  setTaskRestored: (taskRestored: boolean) => void;
+  setGuidedMode: (guidedMode: boolean) => void;
+  setPendingGenerate: (pendingGenerate: boolean) => void;
+  setTemplateId: (templateId: string | null) => void;
+  setDownloadUrl: (url: string | null) => void;
+  setPrintQuality: (pq: TaskStatus["print_quality"] | null) => void;
+
+  // Параметри
+  setRoadWidthMultiplier: (value: number) => void;
+  setRoadHeightMm: (value: number) => void;
+  setRoadEmbedMm: (value: number) => void;
+  setBuildingMinHeight: (value: number) => void;
+  setBuildingHeightMultiplier: (value: number) => void;
+  setBuildingFoundationMm: (value: number) => void;
+  setBuildingEmbedMm: (value: number) => void;
+  setWaterDepth: (value: number) => void;
+  setTerrainEnabled: (value: boolean) => void;
+  setTerrainZScale: (value: number) => void;
+  setTerrainBaseThicknessMm: (value: number) => void;
+  setTerrainResolution: (value: number) => void;
+  setTerrariumZoom: (value: number) => void;
+  setExportFormat: (format: "stl" | "3mf") => void;
+  setModelSizeMm: (value: number) => void;
+
+  setTerrainSmoothShading: (value: boolean) => void;
+  setAmsMode: (value: boolean) => void;
+  setFlatPlateMode: (value: boolean) => void;
+  setPreviewMode: (value: boolean) => void;
+
+  setPreviewIncludeBase: (value: boolean) => void;
+  setPreviewIncludeRoads: (value: boolean) => void;
+  setPreviewIncludeBuildings: (value: boolean) => void;
+  setPreviewIncludeWater: (value: boolean) => void;
+  setPreviewIncludeParks: (value: boolean) => void;
+
+  reset: () => void;
+}
+
+const initialState = {
+  selectedArea: null,
+  isGenerating: false,
+  taskGroupId: null,
+  taskIds: [] as string[],
+  activeTaskId: null,
+  progress: 0,
+  status: "",
+  etaS: null,
+  elapsedS: null,
+  queued: false,
+  queueEta: null,
+  sourceWaitS: null,
+  reconnecting: false,
+  genError: null,
+  printPrep: null,
+  downloadBusy: false,
+  taskRestored: false,
+  guidedMode: false,
+  pendingGenerate: false,
+  templateId: null as string | null,
+  downloadUrl: null,
+  printQuality: null as TaskStatus["print_quality"] | null,
+  taskStatuses: {} as Record<string, TaskStatus>,
+  showAllZones: false,
+  batchZoneMetaByTaskId: {} as Record<string, { zoneId: string; row?: number; col?: number }>,
+  // На 10×10см “реальні” ширини доріг часто виглядають надто товстими — ставимо мʼякший дефолт.
+  roadWidthMultiplier: 0.8,
+  // Дороги: менша висота + трохи більше втиснення дають кращий вигляд і менше z-fighting
+  roadHeightMm: 0.5,
+  roadEmbedMm: 0.3,
+  // Реальні OSM висоти на масштабі 10x10см часто виглядають занадто низько,
+  // тому робимо трохи вищі дефолти (користувач може змінити слайдерами).
+  buildingMinHeight: 5.0,
+  buildingHeightMultiplier: 1.8,
+  buildingFoundationMm: 0.6,
+  buildingEmbedMm: 0.2,
+  waterDepth: 2.0,
+  terrainEnabled: true,
+  terrainZScale: 1.0,
+  // Підложка під рельєф (мм на фінальній моделі). 1.3 (не 0.3) — власник просив
+  // основу на 1мм вищу (тонка ламалась/гнулась по краях панно).
+  terrainBaseThicknessMm: 1.3,
+  // Вища деталізація рельєфу -> менші трикутники, більше “реальності”
+  terrainResolution: 180,
+  terrariumZoom: 15,
+  exportFormat: "3mf" as const,
+  modelSizeMm: 80.0, // 80мм = 8см за замовчуванням
+  zonePolygonCoords: null,
+  cropRotationDeg: 0,
+  figureShape: "rounded",
+  roundCorners: false,
+  gpxFocus: null,
+  simplePanelMode: 0 as const,
+  simpleMagnetMode: false,
+  simpleMapLabel: "",
+  suggestedMapLabel: "",
+  simpleStyleId: "full",
+  simpleTemplate: null,
+  // Дефолт = «Об'ємна 3D» = сьогоднішній стан з усіма спецрежимами ВИМКНЕНО.
+  simpleFormat: "relief3d" as GenerationState["simpleFormat"],
+  simpleColorPalette: "classic",
+  simpleFlatAms: false,
+  simpleConnector: false,
+  simpleSeriesConnectors: true,
+  simpleFrame: false,
+  simpleFrameStyle: "classic",
+  simpleRelief: false,
+  simpleFlatBuildings: false,
+  mapHighlightBuilding: false,
+  highlightPoints: [],
+  highlightFootprints: [],
+  gpxName: null,
+  gpxNote: null,
+  selectedZones: [] as any[],
+  showHexGrid: false,
+  // Дефолт КВАДРАТИ: рівно тайляться у прямокутне панно + сумісні зі зʼєднувачами-
+  // замками (дефолт ON). Раніше hexagonal+connectors-on = замки мовчки не ставились
+  // (NSEW-замок не лягає на гекс). Гексагони лишаються опцією (вимикають замки).
+  gridType: "square" as "hexagonal" | "square" | "circle",
+  // Розмір клітини сітки = сторона плитки в метрах (квадратна сітка). 400м = як
+  // звичайна детальна карта (було 450→~800 сприймалось завеликим). МЕНШІ плитки =
+  // менше геометрії на плитку → менше памʼяті на 4ГБ-проді → OOM не пропускає
+  // груву води (періодична «вода не вирізалась»). Юзер може змінити повзунком.
+  hexSizeM: 400.0,
+  gridRotationDeg: 0,
+
+  // Preview: smooth shading can show a visible seam between separate tiles on slopes
+  terrainSmoothShading: false,
+  isAmsMode: false,
+  flatPlateMode: false,
+  previewMode: true,  // default to fast preview for buyers
+  // Preview visibility defaults - all enabled
+  previewIncludeBase: true,
+  previewIncludeRoads: true,
+  previewIncludeBuildings: true,
+  previewIncludeWater: true,
+  previewIncludeParks: true,
+};
+
+export const useGenerationStore = create<GenerationState>((set) => ({
+  ...initialState,
+
+  setSelectedArea: (area) => set({ selectedArea: area }),
+  setZonePolygonCoords: (coords) => set({ zonePolygonCoords: coords }),
+  setGpxFocus: (focus) => set({ gpxFocus: focus }),
+  setSimplePanelMode: (mode) => set({ simplePanelMode: mode }),
+  setSimpleMagnetMode: (on) => set({ simpleMagnetMode: on }),
+  setSimpleMapLabel: (label) => set({ simpleMapLabel: label }),
+  setSuggestedMapLabel: (label) => set({ suggestedMapLabel: label }),
+  setSimpleStyleId: (id) => set({ simpleStyleId: id }),
+  setSimpleTemplate: (id) => set({ simpleTemplate: id }),
+  // ВЗАЄМОВИКЛЮЧНИЙ формат: один set() похідно синхронізує УСІ легасі-булеві, щоб
+  // buildSingleMapReq лишився без змін і генерувався той самий запит, що й раніше:
+  //  • panno  → simplePanelMode 2|3 (зберігає поточний, дефолт 2), решта off, рельєф лишається;
+  //  • magnet → simpleMagnetMode=true, тримає frame (сумісний), гасить connector/highlight/GPX;
+  //  • flat   → плоска база: гасить рельєф/магніт/панно, flat-AMS і додатки лишає;
+  //  • relief3d → усе off (= сьогоднішній all-off стан), рельєф лишається.
+  // simpleFlatBuildings навмисно НЕ скидаємо — у білдері він під гейтом (flatPlate||magnet),
+  // тож на relief3d/panno інертний.
+  setSimpleColorPalette: (p) => set({ simpleColorPalette: p }),
+  setSimpleFormat: (f) => set((st) => ({
+    simpleFormat: f,
+    simplePanelMode: f === "panno" ? (st.simplePanelMode > 0 ? st.simplePanelMode : 2) : 0,
+    simpleMagnetMode: f === "magnet",
+    // Магніт = гравійований напис; якщо поле порожнє — підставляємо назву міста
+    // (18.09.2026: замість глобального автозаповнення для всіх мап).
+    ...((f === "magnet" && !st.simpleMapLabel.trim() && st.suggestedMapLabel)
+      ? { simpleMapLabel: st.suggestedMapLabel }
+      : {}),
+    // flat: лишаємо поточний flat-AMS (його окремо вмикає чип «Плоска» / тумблер
+    // flat-ams); інші формати — гасимо. flat-AMS це лише ОДИН зі способів плоскої
+    // карти, тож конектор/рамка/дім самі вмикають flat_plate навіть без flat-AMS.
+    simpleFlatAms: f === "flat" ? st.simpleFlatAms : false,
+    simpleRelief: (f === "relief3d" || f === "panno") ? st.simpleRelief : false,
+    // КОНЕКТОР сумісний з flat І з relief3d (рельєф+конектор тепер працює — паз
+    // ріжеться у дно рельєфної бази); гасимо лише для magnet/panno.
+    simpleConnector: (f === "flat" || f === "relief3d") ? st.simpleConnector : false,
+    // FRAME поки flat-only (форсує flat → гасить рельєф); лишаємо для flat і magnet.
+    simpleFrame: (f === "flat" || f === "magnet") ? st.simpleFrame : false,
+    // HIGHLIGHT сумісний з flat І relief3d (рельєф+дім ріжеться у рельєф 3D-булеаном);
+    // гасимо лише на magnet/panno (інша база/пайплайн).
+    ...((f === "flat" || f === "relief3d")
+      ? {}
+      : { mapHighlightBuilding: false, highlightPoints: [], highlightFootprints: [] }),
+    ...((f === "panno" || f === "magnet")
+      ? { gpxFocus: null, gpxName: null, gpxNote: null }
+      : {}),
+  })),
+  setSimpleFlatAms: (on) => set({ simpleFlatAms: on }),
+  setSimpleConnector: (on) => set({ simpleConnector: on }),
+  setSimpleSeriesConnectors: (on) => set({ simpleSeriesConnectors: on }),
+  setSimpleFrame: (on) => set({ simpleFrame: on }),
+  setSimpleFrameStyle: (style) => set({ simpleFrameStyle: style }),
+  setSimpleRelief: (on) => set({ simpleRelief: on }),
+  setSimpleFlatBuildings: (on) => set({ simpleFlatBuildings: on }),
+  setMapHighlightBuilding: (on) => set({ mapHighlightBuilding: on }),
+  clearHighlights: () => set({ highlightPoints: [], highlightFootprints: [] }),
+  addHighlightPoint: (pt) => set((st) => (st.highlightPoints.length >= 12 ? st : ({
+    highlightPoints: [...st.highlightPoints, pt],
+    highlightFootprints: [...st.highlightFootprints, null],
+  }))),
+  removeHighlightAt: (index) => set((st) => (index < 0 || index >= st.highlightPoints.length ? st : ({
+    highlightPoints: st.highlightPoints.filter((_, i) => i !== index),
+    highlightFootprints: st.highlightFootprints.filter((_, i) => i !== index),
+  }))),
+  setHighlightFootprint: (pt, poly) => set((st) => {
+    const i = st.highlightPoints.findIndex((p) => p[0] === pt[0] && p[1] === pt[1]);
+    if (i < 0) return st;
+    const f = [...st.highlightFootprints];
+    f[i] = poly;
+    return { highlightFootprints: f };
+  }),
+  setGpxName: (name) => set({ gpxName: name }),
+  setGpxNote: (note) => set({ gpxNote: note }),
+  setSelectedZones: (zones) => set({ selectedZones: zones }),
+  setShowHexGrid: (on) => set({ showHexGrid: on }),
+  setGridType: (gt) => set({ gridType: gt }),
+  setHexSizeM: (m) => set({ hexSizeM: m }),
+  setGridRotationDeg: (d) => set({ gridRotationDeg: ((d % 360) + 360) % 360 }),
+  setCropRotationDeg: (deg) => set({ cropRotationDeg: deg }),
+  setFigureShape: (figureShape) => set({ figureShape }),
+  setRoundCorners: (roundCorners) => set({ roundCorners }),
+  setGenerating: (isGenerating) => set({ isGenerating }),
+  setTaskGroup: (taskGroupId, taskIds, productType = "map") =>
+    set((s) => {
+      const nextTaskIds = taskIds ?? (taskGroupId ? [taskGroupId] : []);
+      const nextActive = s.activeTaskId && nextTaskIds.includes(s.activeTaskId)
+        ? s.activeTaskId
+        : (nextTaskIds[0] ?? null);
+      // Зберігаємо в localStorage щоб відновити після refresh. ПРОДУКТ-ТИП (map|keychain)
+      // потрібен щоб /create і /keychains відновлювали ЛИШЕ свої задачі (ключ той самий).
+      if (typeof window !== "undefined") {
+        if (taskGroupId) {
+          localStorage.setItem("3dmap_task_group_id", taskGroupId);
+          localStorage.setItem("3dmap_task_ids", JSON.stringify(nextTaskIds));
+          localStorage.setItem("3dmap_task_product", productType);
+        } else {
+          localStorage.removeItem("3dmap_task_group_id");
+          localStorage.removeItem("3dmap_task_ids");
+          localStorage.removeItem("3dmap_task_product");
+        }
+      }
+      return {
+        taskGroupId,
+        taskIds: nextTaskIds,
+        activeTaskId: nextActive,
+        // при новій задачі скидаємо статуси і URL
+        taskStatuses: {},
+        downloadUrl: null,
+        printQuality: null,
+        progress: 0,
+        status: "waiting",
+      };
+    }),
+  setActiveTaskId: (activeTaskId) => set({ activeTaskId }),
+  setTaskStatuses: (taskStatuses) => set({ taskStatuses }),
+  setShowAllZones: (showAllZones) => set({ showAllZones }),
+  setBatchZoneMetaByTaskId: (batchZoneMetaByTaskId) => set({ batchZoneMetaByTaskId }),
+  updateProgress: (progress, status) => set({ progress, status }),
+  setEta: (etaS, elapsedS) => set({ etaS, elapsedS }),
+  setQueued: (queued, queueEta = null) => set({ queued, queueEta: queued ? queueEta : null }),
+  setSourceWait: (sourceWaitS) => set({ sourceWaitS }),
+  setReconnecting: (v) => set({ reconnecting: v }),
+  setGenError: (genError) => set({ genError }),
+  setPrintPrep: (printPrep) => set({ printPrep }),
+  setDownloadBusy: (downloadBusy) => set({ downloadBusy }),
+  setTaskRestored: (taskRestored) => set({ taskRestored }),
+  setGuidedMode: (guidedMode) => set({ guidedMode }),
+  setPendingGenerate: (pendingGenerate) => set({ pendingGenerate }),
+  setTemplateId: (templateId) => set({ templateId }),
+  setDownloadUrl: (url) => set({ downloadUrl: url }),
+  setPrintQuality: (pq) => set({ printQuality: pq }),
+
+  setRoadWidthMultiplier: (value) => set({ roadWidthMultiplier: value }),
+  setRoadHeightMm: (value) => set({ roadHeightMm: value }),
+  setRoadEmbedMm: (value) => set({ roadEmbedMm: value }),
+  setBuildingMinHeight: (value) => set({ buildingMinHeight: value }),
+  setBuildingHeightMultiplier: (value) => set({ buildingHeightMultiplier: value }),
+  setBuildingFoundationMm: (value) => set({ buildingFoundationMm: value }),
+  setBuildingEmbedMm: (value) => set({ buildingEmbedMm: value }),
+  setWaterDepth: (value) => set({ waterDepth: value }),
+  setTerrainEnabled: (value) => set({ terrainEnabled: value }),
+  setTerrainZScale: (value) => set({ terrainZScale: value }),
+  setTerrainBaseThicknessMm: (value) => set({ terrainBaseThicknessMm: value }),
+  setTerrainResolution: (value) => set({ terrainResolution: value }),
+  setTerrariumZoom: (value) => set({ terrariumZoom: value }),
+  setExportFormat: (format) => set({ exportFormat: format }),
+  setModelSizeMm: (value) => set({ modelSizeMm: value }),
+
+  setTerrainSmoothShading: (value) => set({ terrainSmoothShading: value }),
+  setAmsMode: (value) => set({ isAmsMode: value }),
+  setFlatPlateMode: (value) => set({ flatPlateMode: value }),
+  setPreviewMode: (value) => set({ previewMode: value }),
+
+  setPreviewIncludeBase: (value) => set({ previewIncludeBase: value }),
+  setPreviewIncludeRoads: (value) => set({ previewIncludeRoads: value }),
+  setPreviewIncludeBuildings: (value) => set({ previewIncludeBuildings: value }),
+  setPreviewIncludeWater: (value) => set({ previewIncludeWater: value }),
+  setPreviewIncludeParks: (value) => set({ previewIncludeParks: value }),
+
+  reset: () => set(initialState),
+}));
